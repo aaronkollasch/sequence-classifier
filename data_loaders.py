@@ -607,18 +607,21 @@ class IPISequenceDataset(SequenceDataset, TrainTestDataset):
         return {'input': input_arr, 'mask': seq_mask}
 
     def __getitem__(self, index):
-        cdr_seqs = self.cdr_seqs
-        if len(cdr_seqs) == 0:
-            return None
+        if self.unlimited_epoch:
+            indices = np.random.randint(0, self.n_eff, self.batch_size)
+        else:
+            first_index = index * self.batch_size
+            last_index = min((index+1) * self.batch_size, self.n_eff)
+            indices = np.arange(first_index, last_index)
 
-        output_arr = torch.zeros(self.batch_size, len(self.comparisons))
-        cdr_indices = np.random.randint(0, len(cdr_seqs), self.batch_size)
-        seqs = list(cdr_seqs[cdr_indices])
+        seqs = self.cdr_seqs[indices].tolist()
+        output_arr = torch.zeros(len(indices), len(self.comparisons))
         for i, seq in enumerate(seqs):
             for j, output in enumerate(self.cdr_to_output[seq]):
                 output_arr[i, j] = output
 
+        if len(seqs) == 0:
+            return None
         batch = self.sequences_to_onehot(seqs)
         batch['output'] = output_arr
-
         return batch

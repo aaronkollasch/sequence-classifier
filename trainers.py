@@ -1,6 +1,8 @@
 import os
 import time
 
+import numpy as np
+from sklearn.metrics import roc_auc_score
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -74,6 +76,13 @@ class ClassifierTrainer:
     def train(self, steps=1e8):
         self.model.train()
 
+        losses, accuracies, true_outputs, logits, rocs = self.validate()
+        print(f"validation losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}", flush=True)
+        print(f"validation accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}", flush=True)
+        print(f"validation true values: {', '.join(['{:6.4f}'.format(val) for val in true_outputs])}", flush=True)
+        print(f"validation average logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}", flush=True)
+        print(f"validation AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}", flush=True)
+
         pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
         data_iter = iter(self.loader)
 
@@ -102,20 +111,6 @@ class ClassifierTrainer:
 
             losses = {'loss': loss.detach(), 'accuracy': accuracy.detach(), 'grad_norm': total_norm}
 
-            # nan_check = False
-            # if nan_check and (
-            #         any(torch.isnan(param).any() for param in self.model.parameters()) or
-            #         any(torch.isnan(param.grad).any() for param in self.model.parameters())
-            # ):
-            #     print("nan detected:")
-            #     print("{: 8d} {:6.3f} {:5.4f} {:11.6f} {:11.6f}".format(
-            #         step, time.time() - start, data_load_time, loss.detach(), accuracy.detach()))
-            #     print('grad norm', total_norm)
-            #     print('params', [name for name, param in self.model.named_parameters() if torch.isnan(param).any()])
-            #     print('grads', [name for name, param in self.model.named_parameters() if torch.isnan(param.grad).any()])
-            #     self.save_state(last_batch=batch)
-            #     break
-
             self.optimizer.step()
 
             if step % self.params['snapshot_interval'] == 0:
@@ -133,29 +128,44 @@ class ClassifierTrainer:
 
         with torch.no_grad():
             loader = GeneratorDataLoader(self.loader.dataset, num_workers=self.loader.num_workers)
+            pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
+
+            true_outputs = []
+            logits = []
             losses = []
             accuracies = []
             for batch in loader:
                 for key in batch.keys():
                     batch[key] = batch[key].to(self.device, non_blocking=True)
-
-                pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
                 output_logits = self.model(batch['input'], batch['mask'])
 
-                loss = self.model.calculate_loss(output_logits, batch['output'],
-                                                 pos_weight=pos_weights, reduction='none')
-                losses.append(loss)
+                loss = self.model.calculate_loss(
+                    output_logits, batch['output'], pos_weight=pos_weights, reduction='none')
+                error = self.model.calculate_accuracy(
+                    output_logits, batch['output'], reduction='none')
 
-                error = self.model.calculate_accuracy(output_logits, batch['output'],
-                                                      reduction='none')
+                true_outputs.append(batch['output'])
+                logits.append(output_logits)
+                losses.append(loss)
                 accuracies.append(error)
+
+            true_outputs = torch.cat(true_outputs, 0).cpu().numpy()
+            logits = torch.cat(logits, 0).cpu().numpy()
+            roc_scores = roc_auc_score(true_outputs, logits, average=None)
+            if isinstance(roc_scores, np.ndarray):
+                roc_scores = roc_scores.tolist()
+            else:
+                roc_scores = [roc_scores]
+
+            true_outputs = true_outputs.mean(0).tolist()
+            logits = logits.mean(0).tolist()
             losses = torch.cat(losses, 0).mean(0).tolist()
             accuracies = torch.cat(accuracies, 0).mean(0).tolist()
 
         self.model.train()
         self.loader.dataset.train()
         self.loader.dataset.unlimited_epoch = True
-        return losses, accuracies
+        return losses, accuracies, true_outputs, logits, roc_scores
 
     def test(self, data_loader, model_eval=True, num_samples=1):  # TODO implement
         if model_eval:

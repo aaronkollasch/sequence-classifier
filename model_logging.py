@@ -45,12 +45,15 @@ class Logger:
         avg_loss = self.accumulated_loss / self.log_interval
         avg_acc = self.accumulated_accuracy / self.log_interval
         print(f"{time.time()-self.log_time:6.3f} loss, accuracy at step {current_step: 8d}: "
-              f"{avg_loss:11.6f}, {avg_acc:11.6f}", flush=True)
+              f"{avg_loss:10.6f}, {avg_acc:10.6f}", flush=True)
 
     def validate(self, current_step):
-        losses, accuracies = self.trainer.validate()
-        print(f"validation losses: {['{:6.4f}'.format(loss) for loss in losses]}", flush=True)
-        print(f"validation accuracies: {['{:6.3f}'.format(acc * 100) for acc in accuracies]}%", flush=True)
+        losses, accuracies, true_outputs, logits, rocs = self.trainer.validate()
+        print(f"validation losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}", flush=True)
+        print(f"validation accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}", flush=True)
+        # print(f"validation true values: {', '.join(['{:6.4f}'.format(val) for val in true_outputs])}", flush=True)
+        print(f"validation average logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}", flush=True)
+        print(f"validation AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}", flush=True)
 
     def generate(self, current_step):
         if self.generate_function is None:
