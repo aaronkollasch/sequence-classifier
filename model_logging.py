@@ -49,8 +49,8 @@ class Logger:
 
     def validate(self, current_step):
         losses, accuracies = self.trainer.validate()
-        print(f"validation losses: {[round(loss, 4) for loss in losses]}", flush=True)
-        print(f"validation accuracies: {[round(acc * 100, 2) for acc in accuracies]}%", flush=True)
+        print(f"validation losses: {['{:6.4f}'.format(loss) for loss in losses]}", flush=True)
+        print(f"validation accuracies: {['{:6.3f}'.format(acc * 100) for acc in accuracies]}%", flush=True)
 
     def generate(self, current_step):
         if self.generate_function is None:

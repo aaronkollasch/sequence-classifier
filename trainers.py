@@ -80,12 +80,12 @@ class ClassifierTrainer:
         # print('    step  step-t load-t    loss      accuracy', flush=True)
         for step in range(int(self.model.step) + 1, int(steps) + 1):
             self.model.step = step
-            start = time.time()
+            # start = time.time()
 
             batch = next(data_iter)
             for key in batch.keys():
                 batch[key] = batch[key].to(self.device, non_blocking=True)
-            data_load_time = time.time()-start
+            # data_load_time = time.time()-start
 
             output_logits = self.model(batch['input'], batch['mask'])
             loss = self.model.calculate_loss(output_logits, batch['output'], pos_weight=pos_weights)
@@ -129,21 +129,32 @@ class ClassifierTrainer:
     def validate(self):
         self.model.eval()
         self.loader.dataset.test()
+        self.loader.dataset.unlimited_epoch = False
+
         with torch.no_grad():
-            with temp_seed(42):
-                batch = self.loader.dataset.__getitem__(index=0)
-            if batch is None:
-                return 0.0, 0.0
-            for key in batch.keys():
-                batch[key] = batch[key].to(self.device, non_blocking=True)
-            pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
-            output_logits = self.model(batch['input'], batch['mask'])
-            loss = self.model.calculate_loss(output_logits, batch['output'], pos_weight=pos_weights, reduction='none')
-            losses = loss.mean(0).tolist()
-            error = self.model.calculate_accuracy(output_logits, batch['output'], reduction='none')
-            accuracies = error.mean(0).tolist()
+            loader = GeneratorDataLoader(self.loader.dataset, num_workers=self.loader.num_workers)
+            losses = []
+            accuracies = []
+            for batch in loader:
+                for key in batch.keys():
+                    batch[key] = batch[key].to(self.device, non_blocking=True)
+
+                pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
+                output_logits = self.model(batch['input'], batch['mask'])
+
+                loss = self.model.calculate_loss(output_logits, batch['output'],
+                                                 pos_weight=pos_weights, reduction='none')
+                losses.append(loss)
+
+                error = self.model.calculate_accuracy(output_logits, batch['output'],
+                                                      reduction='none')
+                accuracies.append(error)
+            losses = torch.cat(losses, 0).mean(0).tolist()
+            accuracies = torch.cat(accuracies, 0).mean(0).tolist()
+
         self.model.train()
         self.loader.dataset.train()
+        self.loader.dataset.unlimited_epoch = True
         return losses, accuracies
 
     def test(self, data_loader, model_eval=True, num_samples=1):  # TODO implement
