@@ -28,7 +28,6 @@ class DiscriminativeRNN(nn.Module):
                 'bidirectional': True,
                 'dropout_p': 0.2,
                 'use_output': 'global_avg',  # global_avg, final
-                'final_dropout_p': 0.2,
             },
             'dense': {
                 'num_layers': 2,
@@ -49,7 +48,6 @@ class DiscriminativeRNN(nn.Module):
             num_layers=rnn_params['num_layers'], batch_first=True,
             bidirectional=rnn_params['bidirectional'], dropout=rnn_params['dropout_p'])
         self.hidden = None  # don't save as parameter or buffer
-        self.rnn_final_dropout = nn.Dropout(rnn_params['final_dropout_p'])
         rnn_output_size = rnn_params['hidden_size'] * (1 + rnn_params['bidirectional'])
 
         dense_params = self.hyperparams['dense']
@@ -108,7 +106,6 @@ class DiscriminativeRNN(nn.Module):
             num_directions = 1 + rnn_params['bidirectional']
             hiddens = self.hidden.view(num_layers, num_directions, n_batch, hidden_size)[-1]
             hiddens = hiddens.permute(1, 0, 2).contiguous().view(n_batch, num_directions * hidden_size)
-        hiddens = self.rnn_final_dropout(hiddens)
 
         # (batch, output_features)
         features_logits = self.dense_net(hiddens)
