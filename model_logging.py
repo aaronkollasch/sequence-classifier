@@ -104,7 +104,7 @@ class TensorboardLogger(Logger):
             self.image_summary(tag, summary['img'], current_step, max_outputs=summary.get('max_outputs', 3))
 
     def validate(self, current_step):
-        losses, accuracies = self.trainer.validate()
+        losses, accuracies, true_outputs, logits, rocs = self.trainer.validate()
         for i, loss, acc in enumerate(zip(losses, accuracies)):
             self.scalar_summary(f'validation loss {i}', loss, current_step)
             self.scalar_summary(f'validation accuracy {i}', acc, current_step)

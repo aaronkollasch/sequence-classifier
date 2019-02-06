@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from functions import Nonlinearity
 from utils import recursive_update
+import layers
 
 
 class DiscriminativeRNN(nn.Module):
@@ -33,9 +34,31 @@ class DiscriminativeRNN(nn.Module):
                 'num_layers': 2,
                 'hidden_size': 50,
                 'output_features': 1,
-                'nonlinearity': 'elu',
+                'nonlinearity': 'relu',
                 'normalization': 'batch',
                 'dropout_p': 0.5,
+                'ordering': ['nonlin', 'norm', 'dropout', 'linear'],
+            },
+            'sampler_hyperparams': {
+                'warm_up': 10000,
+                'annealing_type': 'linear',
+                'anneal_kl': True,
+                'anneal_noise': True
+            },
+            'regularization': {
+                'l2': True,
+                'l2_lambda': 1.,
+                'bayesian': False,
+                'bayesian_lambda': 0.01,
+                'rho_type': 'rho',  # rho, log_sigma
+                'prior_type': 'gaussian',  # gaussian, mix2gaussians
+                'prior_params': [0., 1.],
+            },
+            'optimization': {
+                'optimizer': 'Adam',
+                'lr': 0.001,
+                'weight_decay': 0.0,
+                'clip': 10.0,
             }
         }
         if hyperparams is not None:
@@ -43,10 +66,19 @@ class DiscriminativeRNN(nn.Module):
 
         rnn_params = self.hyperparams['rnn']
         # self.W_embedding = nn.Linear(self.dims['alphabet'], rnn_params['hidden_size'])
-        self.rnn = nn.GRU(
+        if self.hyperparams['regularization']['bayesian']:
+            rnn = layers.BayesianGRU
+        else:
+            rnn = layers.GRU
+        self.rnn = rnn(
             input_size=self.dims['alphabet'], hidden_size=rnn_params['hidden_size'],
             num_layers=rnn_params['num_layers'], batch_first=True,
-            bidirectional=rnn_params['bidirectional'], dropout=rnn_params['dropout_p'])
+            bidirectional=rnn_params['bidirectional'], dropout=rnn_params['dropout_p'],
+            hyperparams={
+                'sampler_hyperparams': self.hyperparams['sampler_hyperparams'],
+                'regularization': self.hyperparams['regularization']
+            },
+        )
         self.hidden = None  # don't save as parameter or buffer
         rnn_output_size = rnn_params['hidden_size'] * (1 + rnn_params['bidirectional'])
 
@@ -59,11 +91,17 @@ class DiscriminativeRNN(nn.Module):
             if i == dense_params['num_layers']:
                 output_size = dense_params['output_features']
 
-            if dense_params['normalization'] == 'batch':
-                dense_net[f'norm_{i}'] = nn.BatchNorm1d(input_size)
-            dense_net[f'nonlin_{i}'] = Nonlinearity(dense_params['nonlinearity'])
-            dense_net[f'dropout_{i}'] = nn.Dropout(dense_params['dropout_p'])
-            dense_net[f'linear_{i}'] = nn.Linear(input_size, output_size)
+            for layer_type in dense_params['ordering']:
+                if layer_type == 'norm':
+                    if dense_params['normalization'] == 'batch':
+                        dense_net[f'norm_{i}'] = nn.BatchNorm1d(input_size)
+                elif layer_type == 'nonlin':
+                    dense_net[f'nonlin_{i}'] = Nonlinearity(dense_params['nonlinearity'])
+                elif layer_type == 'dropout':
+                    dense_net[f'dropout_{i}'] = nn.Dropout(dense_params['dropout_p'])
+                elif layer_type == 'linear':
+                    dense_net[f'linear_{i}'] = nn.Linear(input_size, output_size)
+        self.dense_net_modules = dense_net
         self.dense_net = nn.Sequential(dense_net)
 
         self.step = 0
@@ -75,6 +113,15 @@ class DiscriminativeRNN(nn.Module):
         h0 = torch.zeros(num_layers, batch_size, rnn_params['hidden_size']).to(device)
         # c0 = torch.zeros(rnn_params['num_layers'], batch_size, hidden_size).to(device)  # for use with LSTM model
         return h0
+
+    def weight_costs(self):
+        return (
+            self.rnn.weight_costs() +
+            [module.weight.pow(2).sum() + module.bias.pow(2).sum()
+             for name, module in self.dense_net_modules.items() if name.startswith('linear')] +
+            [module.weight.pow(2).sum() + module.bias.pow(2).sum()
+             for name, module in self.dense_net_modules.items() if name.startswith('norm')]
+        )
 
     def parameter_count(self):
         return sum(param.numel() for param in self.parameters())
@@ -92,7 +139,7 @@ class DiscriminativeRNN(nn.Module):
         x = inputs * input_masks
 
         # out_states: (batch, seq_len, num_directions * hidden_size)
-        out_states, self.hidden = self.rnn(x, self.hidden)
+        out_states, self.hidden = self.rnn(x, self.hidden, step=self.step)
 
         # hiddens: (batch, num_directions * hidden_size)
         rnn_params = self.hyperparams['rnn']
@@ -111,9 +158,18 @@ class DiscriminativeRNN(nn.Module):
         features_logits = self.dense_net(hiddens)
         return features_logits
 
-    @staticmethod
-    def calculate_loss(logits, targets, pos_weight=None, reduction='mean'):
-        return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight, reduction=reduction)
+    def calculate_loss(self, logits, targets, n_eff=1., pos_weight=None, reduction='mean'):
+        reg_params = self.hyperparams['regularization']
+        ce_loss = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight, reduction=reduction)
+        loss = ce_loss
+        if reg_params['l2'] or reg_params['bayesian']:
+            lambda_ = reg_params['bayesian_lambda'] if reg_params['bayesian'] else reg_params['l2_lambda']
+            weight_cost = torch.stack(self.weight_costs()).sum() * lambda_ / n_eff
+            loss += weight_cost
+        return {
+            'loss': loss,
+            'ce_loss': ce_loss
+        }
 
     @staticmethod
     def predict(logits, threshold=0.5):

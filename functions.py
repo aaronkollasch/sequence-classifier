@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributions as dist
 import torch.autograd as autograd
 
 
@@ -18,12 +19,21 @@ def swish(x):
     return x * torch.sigmoid(x)
 
 
+def log_one_plus_exp(x):
+    """Numerically stable log(1+exp(x)).
+    Equivalent to -F.logsigmoid(-x).
+    """
+    a = x.clamp_min(0.)
+    return a + torch.log((-a).exp() + (x - a).exp())
+
+
 ACT_TO_FUN = {
     'elu': F.elu,
     'relu': F.relu,
     'lrelu': F.leaky_relu,
     'gelu': gelu,
     'swish': swish,
+    'log_one_plus_exp': log_one_plus_exp,
     'none': lambda x: x,
 }
 
@@ -34,12 +44,15 @@ def nonlinearity(nonlin_type):
 
 class Nonlinearity(nn.Module):
     def __init__(self, nonlin_type):
-        super(Nonlinearity, self).__init__()
+        nn.Module.__init__(self)
         self.nonlin_type = nonlin_type
         self.nonlinearity = nonlinearity(nonlin_type)
 
     def forward(self, x):
         return self.nonlinearity(x)
+
+    def extra_repr(self):
+        return f'"{self.nonlin_type}"'
 
 
 def comb_losses(losses_f, losses_r):
@@ -52,6 +65,10 @@ def comb_losses(losses_f, losses_r):
             losses_comb[key + '_f'] = losses_f[key]
             losses_comb[key + '_r'] = losses_r[key]
     return losses_comb
+
+
+def clamp(x, min_val=0., max_val=1.):
+    return max(min_val, min(x, max_val))
 
 
 def l2_normalize(w, dim, eps=1e-12):
@@ -114,3 +131,43 @@ class Normalize(autograd.Function):
 
 
 normalize = Normalize.apply
+
+
+def rsample(mu, sigma, stddev=None):
+    """Reparameterized sample from normal distribution"""
+    eps = torch.randn_like(sigma)
+    if stddev is not None:
+        eps *= stddev
+    return mu + sigma * eps
+
+
+def kl_diag_gaussians(mu, logvar, prior_mu, prior_logvar):
+    """ KL divergence between two Diagonal Gaussians """
+    return 0.5 * (
+        prior_logvar - logvar
+        + (logvar.exp() + (mu - prior_mu).pow(2)) / prior_logvar.exp()
+    ).sum() - 0.5
+
+
+def kl_normal(mu, sigma, prior_mu, prior_sigma):
+    return dist.kl_divergence(
+        dist.Normal(mu, sigma),
+        dist.Normal(prior_mu, prior_sigma)
+    )
+
+
+def kl_standard_normal(mu, logvar):
+    """ KL divergence between Diagonal Gaussian and standard normal"""
+    return -0.5 * (logvar - mu.pow(2) - logvar.exp()).sum() - 0.5
+
+
+def kl_mixture_gaussians(
+        self, mu, sigma,
+        p=0.1, mu_one=0., sigma_one=1., mu_two=0., sigma_two=0.01,
+):
+    gauss_one = dist.Normal(mu_one, sigma_one)
+    gauss_two = dist.Normal(mu_two, sigma_two)
+    entropy = 0.5 * torch.log(2.0 * math.pi * math.e * sigma.pow(2))
+    return (p * gauss_one.log_prob(mu)) + ((1. - p) * gauss_two.log_prob(mu)) + entropy
+
+

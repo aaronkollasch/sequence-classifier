@@ -16,10 +16,6 @@ from utils import temp_seed
 
 class ClassifierTrainer:
     default_params = {
-            'optimizer': 'Adam',
-            'lr': 0.001,
-            'weight_decay': 0.001,
-            'clip': 10.0,
             'snapshot_path': None,
             'snapshot_name': 'snapshot',
             'snapshot_interval': 1000,
@@ -42,6 +38,7 @@ class ClassifierTrainer:
             device=torch.device('cpu')
     ):
         self.params = self.default_params.copy()
+        self.params.update(model.hyperparams['optimization'])
         if params is not None:
             self.params.update(params)
         if optimizer is not None:
@@ -85,6 +82,7 @@ class ClassifierTrainer:
 
         pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
         data_iter = iter(self.loader)
+        n_eff = self.loader.dataset.n_eff
 
         # print('    step  step-t load-t    loss      accuracy', flush=True)
         for step in range(int(self.model.step) + 1, int(steps) + 1):
@@ -97,19 +95,21 @@ class ClassifierTrainer:
             # data_load_time = time.time()-start
 
             output_logits = self.model(batch['input'], batch['mask'])
-            loss = self.model.calculate_loss(output_logits, batch['output'], pos_weight=pos_weights)
+            losses = self.model.calculate_loss(output_logits, batch['output'], n_eff=n_eff, pos_weight=pos_weights)
             accuracy = self.model.calculate_accuracy(output_logits, batch['output'])
             del self.model.hidden
 
             self.optimizer.zero_grad()
-            loss.backward()
+            losses['loss'].backward()
 
             if self.params['clip'] is not None:
                 total_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.params['clip'])
             else:
                 total_norm = 0.0
 
-            losses = {'loss': loss.detach(), 'accuracy': accuracy.detach(), 'grad_norm': total_norm}
+            for key in losses:
+                losses[key] = losses[key].detach()
+            losses.update({'accuracy': accuracy.detach(), 'grad_norm': total_norm})
 
             self.optimizer.step()
 
@@ -129,6 +129,7 @@ class ClassifierTrainer:
         with torch.no_grad():
             loader = GeneratorDataLoader(self.loader.dataset, num_workers=self.loader.num_workers)
             pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
+            n_eff = len(self.loader.dataset.cdr_seqs_train)
 
             true_outputs = []
             logits = []
@@ -139,14 +140,14 @@ class ClassifierTrainer:
                     batch[key] = batch[key].to(self.device, non_blocking=True)
                 output_logits = self.model(batch['input'], batch['mask'])
 
-                loss = self.model.calculate_loss(
-                    output_logits, batch['output'], pos_weight=pos_weights, reduction='none')
+                loss_dict = self.model.calculate_loss(
+                    output_logits, batch['output'], n_eff=n_eff, pos_weight=pos_weights, reduction='none')
                 error = self.model.calculate_accuracy(
                     output_logits, batch['output'], reduction='none')
 
                 true_outputs.append(batch['output'])
                 logits.append(output_logits)
-                losses.append(loss)
+                losses.append(loss_dict['loss'])
                 accuracies.append(error)
 
             true_outputs = torch.cat(true_outputs, 0).cpu().numpy()

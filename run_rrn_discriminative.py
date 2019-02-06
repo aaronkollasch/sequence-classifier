@@ -8,8 +8,8 @@ import numpy as np
 import torch
 
 import data_loaders
-import model
-import trainer
+import models
+import trainers
 import model_logging
 from utils import get_cuda_version, get_cudnn_version
 
@@ -122,7 +122,7 @@ if args.restore is not None:
         hyperparams['rnn']['dropout_p'] = args.dropout_p_rnn
     if args.dropout_p_dense is not None:
         hyperparams['dense']['dropout_p'] = args.dropout_p_dense
-    model = model.DiscriminativeRNN(dims=dims, hyperparams=hyperparams)
+    model = models.DiscriminativeRNN(dims=dims, hyperparams=hyperparams)
 else:
     checkpoint = args.restore
     trainer_params = None
@@ -136,10 +136,10 @@ else:
     ):
         if param is not None:
             hyperparams[param_name_1][param_name_2] = param
-    model = model.DiscriminativeRNN(dims=dims, hyperparams=hyperparams)
+    model = models.DiscriminativeRNN(dims=dims, hyperparams=hyperparams)
 model.to(device)
 
-trainer = trainer.ClassifierTrainer(
+trainer = trainers.ClassifierTrainer(
     model=model,
     data_loader=loader,
     params=trainer_params,
