@@ -125,12 +125,24 @@ class Normalize(autograd.Function):
 
     @staticmethod
     def test():
-        x = torch.DoubleTensor(3, 4, 2, 5).normal_(0, 1).requires_grad_()
+        x = torch.DoubleTensor(2, 3, 1, 4).normal_(0, 1).requires_grad_()
         inputs = (x, 1)
         return autograd.gradcheck(Normalize.apply, inputs)
 
 
 normalize = Normalize.apply
+
+
+def anneal(step, hyperparams):
+    warm_up = hyperparams["warm_up"]
+    annealing_type = hyperparams["annealing_type"]
+    if annealing_type == "linear":
+        return min(step / warm_up, 1.)
+    elif annealing_type == "piecewise_linear":
+        return clamp(torch.tensor(step - warm_up).float().sigmoid().item() * ((step - warm_up) / warm_up))
+    elif annealing_type == "sigmoid":
+        slope = hyperparams["sigmoid_slope"]
+        return torch.sigmoid(torch.tensor(slope * (step - warm_up))).item()
 
 
 def rsample(mu, sigma, stddev=None):
@@ -149,25 +161,35 @@ def kl_diag_gaussians(mu, logvar, prior_mu, prior_logvar):
     ).sum() - 0.5
 
 
-def kl_normal(mu, sigma, prior_mu, prior_sigma):
+# def kl_standard_normal(mu, logvar):
+#     """ KL divergence between Diagonal Gaussian and standard normal"""
+#     return -0.5 * (logvar - mu.pow(2) - logvar.exp()).sum() - 0.5
+
+
+def kl_standard_normal(mu, sigma):
+    """ KL divergence between Diagonal Gaussian and standard normal"""
+    return -0.5 * (sigma.log() * 2 - mu.pow(2) - sigma.pow(2)).sum() - 0.5
+
+
+def kl_normal(mu, sigma, prior_mu=0., prior_sigma=1.):
     return dist.kl_divergence(
         dist.Normal(mu, sigma),
         dist.Normal(prior_mu, prior_sigma)
     )
 
 
-def kl_standard_normal(mu, logvar):
-    """ KL divergence between Diagonal Gaussian and standard normal"""
-    return -0.5 * (logvar - mu.pow(2) - logvar.exp()).sum() - 0.5
-
-
 def kl_mixture_gaussians(
-        self, mu, sigma,
-        p=0.1, mu_one=0., sigma_one=1., mu_two=0., sigma_two=0.01,
+        mu, sigma,
+        p=0.1, mu_one=0., sigma_one=1., mu_two=0., sigma_two=0.001,
 ):
-    gauss_one = dist.Normal(mu_one, sigma_one)
-    gauss_two = dist.Normal(mu_two, sigma_two)
-    entropy = 0.5 * torch.log(2.0 * math.pi * math.e * sigma.pow(2))
-    return (p * gauss_one.log_prob(mu)) + ((1. - p) * gauss_two.log_prob(mu)) + entropy
+    prob_one = dist.Normal(mu_one, sigma_one).log_prob(mu) + math.log(clamp(p, 1e-10, 1))
+    prob_two = dist.Normal(mu_two, sigma_two).log_prob(mu) + math.log(clamp(1 - p, 1e-10, 1))
+    entropy = 0.5 * math.log(2.0 * math.pi * math.e) + sigma.log()
+    return torch.logsumexp(torch.stack([prob_one, prob_two]), dim=0) + entropy
 
 
+def mle_mixture_gaussians(w, p=0.1, mu_one=0., sigma_one=1., mu_two=0., sigma_two=0.01):
+    """Log probability of w with a scale mixture of gaussians prior"""
+    prob_one = dist.Normal(mu_one, sigma_one).log_prob(w) + math.log(clamp(p, 1e-10, 1))
+    prob_two = dist.Normal(mu_two, sigma_two).log_prob(w) + math.log(clamp(1-p, 1e-10, 1))
+    return torch.logsumexp(torch.stack([prob_one, prob_two]), dim=0)

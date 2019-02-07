@@ -1,4 +1,6 @@
 from collections import OrderedDict
+from typing import Union, Dict, Sequence
+import warnings
 
 import torch
 import torch.nn as nn
@@ -22,7 +24,7 @@ class DiscriminativeRNN(nn.Module):
         if dims is not None:
             self.dims.update(dims)
 
-        self.hyperparams = {
+        self.hyperparams: Dict[str, Dict[str, Union[int, bool, float, str, Sequence]]] = {
             'rnn': {
                 'hidden_size': 100,
                 'num_layers': 2,
@@ -48,42 +50,70 @@ class DiscriminativeRNN(nn.Module):
             'regularization': {
                 'l2': True,
                 'l2_lambda': 1.,
-                'bayesian': False,
-                'bayesian_lambda': 0.01,
+                'bayesian': False,  # if True, disables l2 regularization
+                'bayesian_lambda': 0.1,
                 'rho_type': 'rho',  # rho, log_sigma
-                'prior_type': 'gaussian',  # gaussian, mix2gaussians
-                'prior_params': [0., 1.],
+                'prior_type': 'gaussian',  # gaussian, scale_mix_gaussian
+                'prior_params': None,
             },
             'optimization': {
                 'optimizer': 'Adam',
                 'lr': 0.001,
-                'weight_decay': 0.0,
+                'weight_decay': 0,  # trainer divides by n_eff before using
                 'clip': 10.0,
             }
         }
         if hyperparams is not None:
             recursive_update(self.hyperparams, hyperparams)
 
+        if self.hyperparams['regularization']['bayesian']:
+            self.hyperparams['regularization']['l2'] = False
+        elif self.hyperparams['regularization']['l2']:
+            # torch built-in weight decay is more efficient than manual calculation
+            self.hyperparams['optimization']['weight_decay'] = self.hyperparams['regularization']['l2_lambda']
+        if self.hyperparams['regularization']['prior_params'] is None:
+            if self.hyperparams['regularization']['prior_type'] == 'gaussian':
+                self.hyperparams['regularization']['prior_params'] = (0., 1.)
+            elif self.hyperparams['regularization']['prior_type'] == 'scale_mix_gaussian':
+                self.hyperparams['regularization']['prior_params'] = (0.1, 0., 1., 0., 0.001)
+        if self.hyperparams['regularization']['bayesian'] and \
+                self.hyperparams['rnn']['dropout_p'] > 0 or self.hyperparams['rnn']['dropout_p'] > 0:
+            warnings.warn("Using both weight uncertainty and dropout")
+
+        # Initialize RNN modules
         rnn_params = self.hyperparams['rnn']
-        # self.W_embedding = nn.Linear(self.dims['alphabet'], rnn_params['hidden_size'])
         if self.hyperparams['regularization']['bayesian']:
             rnn = layers.BayesianGRU
+            bayesian_params = {
+                'sampler_hyperparams': self.hyperparams['sampler_hyperparams'],
+                'regularization': self.hyperparams['regularization']
+            }
         else:
             rnn = layers.GRU
+            bayesian_params = None
+
         self.rnn = rnn(
             input_size=self.dims['alphabet'], hidden_size=rnn_params['hidden_size'],
             num_layers=rnn_params['num_layers'], batch_first=True,
             bidirectional=rnn_params['bidirectional'], dropout=rnn_params['dropout_p'],
-            hyperparams={
-                'sampler_hyperparams': self.hyperparams['sampler_hyperparams'],
-                'regularization': self.hyperparams['regularization']
-            },
+            hyperparams=bayesian_params,
         )
         self.hidden = None  # don't save as parameter or buffer
         rnn_output_size = rnn_params['hidden_size'] * (1 + rnn_params['bidirectional'])
 
+        # Initialize dense layers
         dense_params = self.hyperparams['dense']
         dense_net = OrderedDict()
+        norm = None
+        if self.hyperparams['regularization']['bayesian']:
+            linear = layers.BayesianLinear
+            if dense_params['normalization'] == 'batch':
+                norm = layers.BayesianBatchNorm1d
+        else:
+            linear = layers.Linear
+            if dense_params['normalization'] == 'batch':
+                norm = layers.BatchNorm1d
+
         for i in range(1, dense_params['num_layers']+1):
             input_size = output_size = dense_params['hidden_size']
             if i == 1:
@@ -92,15 +122,14 @@ class DiscriminativeRNN(nn.Module):
                 output_size = dense_params['output_features']
 
             for layer_type in dense_params['ordering']:
-                if layer_type == 'norm':
-                    if dense_params['normalization'] == 'batch':
-                        dense_net[f'norm_{i}'] = nn.BatchNorm1d(input_size)
+                if layer_type == 'norm' and norm is not None:
+                    dense_net[f'norm_{i}'] = norm(input_size, hyperparams=bayesian_params)
                 elif layer_type == 'nonlin':
                     dense_net[f'nonlin_{i}'] = Nonlinearity(dense_params['nonlinearity'])
                 elif layer_type == 'dropout':
                     dense_net[f'dropout_{i}'] = nn.Dropout(dense_params['dropout_p'])
                 elif layer_type == 'linear':
-                    dense_net[f'linear_{i}'] = nn.Linear(input_size, output_size)
+                    dense_net[f'linear_{i}'] = linear(input_size, output_size, hyperparams=bayesian_params)
         self.dense_net_modules = dense_net
         self.dense_net = nn.Sequential(dense_net)
 
@@ -117,11 +146,14 @@ class DiscriminativeRNN(nn.Module):
     def weight_costs(self):
         return (
             self.rnn.weight_costs() +
-            [module.weight.pow(2).sum() + module.bias.pow(2).sum()
-             for name, module in self.dense_net_modules.items() if name.startswith('linear')] +
-            [module.weight.pow(2).sum() + module.bias.pow(2).sum()
-             for name, module in self.dense_net_modules.items() if name.startswith('norm')]
+            [cost
+             for name, module in self.dense_net_modules.items()
+             if name.startswith('linear') or name.startswith('norm')
+             for cost in module.weight_costs()]
         )
+
+    def weight_cost(self):
+        return torch.stack(self.weight_costs()).sum()
 
     def parameter_count(self):
         return sum(param.numel() for param in self.parameters())
@@ -162,10 +194,15 @@ class DiscriminativeRNN(nn.Module):
         reg_params = self.hyperparams['regularization']
         ce_loss = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight, reduction=reduction)
         loss = ce_loss
-        if reg_params['l2'] or reg_params['bayesian']:
-            lambda_ = reg_params['bayesian_lambda'] if reg_params['bayesian'] else reg_params['l2_lambda']
-            weight_cost = torch.stack(self.weight_costs()).sum() * lambda_ / n_eff
-            loss += weight_cost
+
+        # regularization
+        if reg_params['bayesian']:
+            loss += self.weight_cost() * reg_params['bayesian_lambda'] / n_eff
+        elif reg_params['l2']:
+            # # Skip; use built-in optimizer weight_decay instead
+            # loss += self.weight_cost() * reg_params['l2_lambda'] / n_eff
+            pass
+
         return {
             'loss': loss,
             'ce_loss': ce_loss

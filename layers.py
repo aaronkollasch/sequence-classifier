@@ -2,38 +2,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
+import torch.distributions as dist
 
-from functions import clamp, rsample, kl_normal, log_one_plus_exp
+from functions import anneal, rsample, kl_normal, mle_mixture_gaussians, log_one_plus_exp
 
 
 class HyperparameterError(ValueError):
     pass
 
 
-# def _anneal(step, sampler_hyperparams):
-#     warm_up = sampler_hyperparams["warm_up"]
-#     annealing_type = sampler_hyperparams["annealing_type"]
-#     if annealing_type == "linear":
-#         return min(step / warm_up, 1.)
-#     elif annealing_type == "piecewise_linear":
-#         return clamp(
-#             torch.tensor(step - warm_up).float().sigmoid().item()
-#             * ((step - warm_up) / warm_up),
-#             0., 1.
-#         )
-#     elif annealing_type == "sigmoid":
-#         slope = sampler_hyperparams["sigmoid_slope"]
-#         return torch.tensor(slope * (step - warm_up)).sigmoid().item()
-
-
-class BayesianRegularizer(object):
+class GaussianWeightUncertainty(object):
     """Implementation of weight uncertainty
-    From https://arxiv.org/abs/1505.05424"""
-    def __init__(self, name, rho_type='rho', prior_type='gaussian', prior_params=(0., 1.)):
+    From https://arxiv.org/abs/1505.05424
+    See also https://www.nitarshan.com/bayes-by-backprop/"""
+    def __init__(self, name, hyperparams):
         self.name = name
-        self.rho_type = rho_type  # rho, log_sigma
-        self.prior_type = prior_type  # gaussian, mix2gaussians  # TODO implement MoG
-        self.prior_params = prior_params
+        self.rho_type = hyperparams['rho_type']  # rho, log_sigma
+        self.prior_type = hyperparams['prior_type']  # gaussian, scale_mix_gaussian
+        self.prior_params = hyperparams['prior_params']
 
     def rho_to_sigma(self, rho):
         if self.rho_type == 'rho':
@@ -41,15 +27,9 @@ class BayesianRegularizer(object):
         elif self.rho_type == 'log_sigma':
             return rho.exp()
 
-    def rho_to_log_sigma(self, rho):
-        if self.rho_type == 'rho':
-            return log_one_plus_exp(rho).log()
-        elif self.rho_type == 'log_sigma':
-            return rho
-
-    def compute_weight(self, module, stddev=1.):
+    def sample_weight(self, module, stddev=1.):
         mu = getattr(module, self.name + '_mu')
-        if stddev == 0.:
+        if not module.training or stddev == 0.:
             return mu
         sigma = self.rho_to_sigma(getattr(module, self.name + '_rho'))
         return rsample(mu, sigma, stddev=stddev)
@@ -57,7 +37,21 @@ class BayesianRegularizer(object):
     def weight_costs(self, module):
         mu = getattr(module, self.name + '_mu')
         sigma = self.rho_to_sigma(getattr(module, self.name + '_rho'))
-        return kl_normal(mu, sigma, *self.prior_params).sum()
+        if self.prior_type == 'gaussian':
+            return kl_normal(mu, sigma, *self.prior_params)
+        elif self.prior_type == 'scale_mix_gaussian':
+            # No analytical solution for KL divergence,
+            # so use current sample from variational posterior instead.
+            if module.training:
+                weight = getattr(module, self.name)
+            else:
+                weight = mu
+            log_prior = mle_mixture_gaussians(weight, *self.prior_params)
+            log_variational_posterior = dist.Normal(mu, sigma).log_prob(weight)
+            return log_variational_posterior - log_prior
+
+    def weight_cost(self, module):
+        return self.weight_costs(module).sum()
 
     def apply(self, module):
         weight = getattr(module, self.name)
@@ -65,7 +59,7 @@ class BayesianRegularizer(object):
 
         module.register_parameter(self.name + '_mu', Parameter(weight.data))
         module.register_parameter(self.name + '_rho', Parameter(-7 * torch.ones_like(weight).data))
-        setattr(module, self.name, self.compute_weight(module))
+        object.__setattr__(module, self.name, self.sample_weight(module))
 
     def remove(self, module):
         weight = getattr(module, self.name + '_mu')
@@ -75,7 +69,79 @@ class BayesianRegularizer(object):
         module.register_parameter(self.name, Parameter(weight.data))
 
     def __call__(self, module, stddev=1.):
-        setattr(module, self.name, self.compute_weight(module, stddev=stddev))
+        object.__setattr__(module, self.name, self.sample_weight(module, stddev=stddev))
+
+
+class Linear(nn.Linear):
+    def __init__(self, *args, **kwargs):
+        kwargs.pop('hyperparams', None)
+        nn.Linear.__init__(self, *args, **kwargs)
+
+    def weight_costs(self):
+        return [self.weight.pow(2).sum(), self.bias.pow(2).sum()]
+
+    def forward(self, x, step=0):
+        return nn.Linear.forward(self, x)
+
+
+class BayesianLinear(nn.Linear):
+    def __init__(self, *args, **kwargs):
+        self.hyperparams = kwargs.pop('hyperparams')
+        nn.Linear.__init__(self, *args, **kwargs)
+
+        self.regularizers = {}
+        names = [name for name, _ in self.named_parameters()]
+        for name in names:
+            regularizer = GaussianWeightUncertainty(name, self.hyperparams['regularization'])
+            regularizer.apply(self)
+            self.regularizers[name] = regularizer
+
+    def weight_costs(self):
+        return [regularizer.weight_cost(self) for regularizer in self.regularizers.values()]
+
+    def forward(self, x, step=0):
+        stddev = anneal(step, self.hyperparams['sampler_hyperparams'])
+        for regularizer in self.regularizers.values():
+            regularizer(self, stddev=stddev)
+
+        output = nn.Linear.forward(self, x)
+        return output
+
+
+class BatchNorm1d(nn.BatchNorm1d):
+    def __init__(self, *args, **kwargs):
+        kwargs.pop('hyperparams', None)
+        nn.BatchNorm1d.__init__(self, *args, **kwargs)
+
+    def weight_costs(self):
+        return [self.weight.pow(2).sum(), self.bias.pow(2).sum()]
+
+    def forward(self, x, step=0):
+        return nn.BatchNorm1d.forward(self, x)
+
+
+class BayesianBatchNorm1d(nn.BatchNorm1d):
+    def __init__(self, *args, **kwargs):
+        self.hyperparams = kwargs.pop('hyperparams')
+        nn.BatchNorm1d.__init__(self, *args, **kwargs)
+
+        self.regularizers = {}
+        names = [name for name, _ in self.named_parameters()]
+        for name in names:
+            regularizer = GaussianWeightUncertainty(name, self.hyperparams['regularization'])
+            regularizer.apply(self)
+            self.regularizers[name] = regularizer
+
+    def weight_costs(self):
+        return [regularizer.weight_cost(self) for regularizer in self.regularizers.values()]
+
+    def forward(self, x, step=0):
+        stddev = anneal(step, self.hyperparams['sampler_hyperparams'])
+        for regularizer in self.regularizers.values():
+            regularizer(self, stddev=stddev)
+
+        output = nn.BatchNorm1d.forward(self, x)
+        return output
 
 
 class GRU(nn.GRU):
@@ -98,40 +164,19 @@ class BayesianGRU(nn.GRU):
         self.regularizers = {}
         names = [name for name, _ in self.named_parameters()]
         for name in names:
-            regularizer = BayesianRegularizer(
-                name,
-                rho_type=self.hyperparams['regularization']['rho_type'],
-                prior_type=self.hyperparams['regularization']['prior_type'],
-                prior_params=self.hyperparams['regularization']['prior_params'],
-            )
+            regularizer = GaussianWeightUncertainty(name, self.hyperparams['regularization'])
             regularizer.apply(self)
             self.regularizers[name] = regularizer
 
     def weight_costs(self):
-        return [regularizer.weight_costs(self) for regularizer in self.regularizers.values()]
-
-    def _anneal(self, step):
-        warm_up = self.hyperparams["sampler_hyperparams"]["warm_up"]
-        annealing_type = self.hyperparams["sampler_hyperparams"]["annealing_type"]
-        if annealing_type == "linear":
-            return min(step / warm_up, 1.)
-        elif annealing_type == "piecewise_linear":
-            return clamp(torch.tensor(step - warm_up).float().sigmoid().item() * ((step - warm_up) / warm_up))
-        elif annealing_type == "sigmoid":
-            slope = self.hyperparams["sampler_hyperparams"]["sigmoid_slope"]
-            return torch.sigmoid(torch.tensor(slope * (step - warm_up))).item()
+        return [regularizer.weight_cost(self) for regularizer in self.regularizers.values()]
 
     def forward(self, x, hx=None, step=0):
-        stddev = self._anneal(step)  # if self.training else 0.
+        stddev = anneal(step, self.hyperparams['sampler_hyperparams'])
         for regularizer in self.regularizers.values():
-            regularizer(self, stddev=stddev)  # resample weights
+            regularizer(self, stddev=stddev)
 
         output = nn.GRU.forward(self, x, hx)
-
-        for layer_param_names in self._all_weights:
-            for name in layer_param_names:
-                delattr(self, name)
-
         return output
 
     @property
@@ -139,6 +184,6 @@ class BayesianGRU(nn.GRU):
         return [p for layerparams in self.all_weights for p in layerparams]
 
     @property
-    def all_weights(self):  # included with _flat_weights for interpretability; may not be necessary
+    def all_weights(self):  # included with _flat_weights for interpretability, but may not be necessary
         return [[getattr(self, weight) for weight in weights] for weights in self._all_weights]
 

@@ -17,7 +17,7 @@ class TestFunctions(unittest.TestCase):
     def test_log_one_plus_exp_randn(self):
         x = torch.randn(1000)
         self.assertTrue(torch.allclose(
-            -F.logsigmoid(-x),
+            torch.log1p(torch.exp(x)),
             log_one_plus_exp(x)
         ))
 

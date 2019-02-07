@@ -16,6 +16,10 @@ from utils import temp_seed
 
 class ClassifierTrainer:
     default_params = {
+            'optimizer': 'Adam',
+            'lr': 0.001,
+            'weight_decay': 0,
+            'clip': 10.0,
             'snapshot_path': None,
             'snapshot_name': 'snapshot',
             'snapshot_interval': 1000,
@@ -57,6 +61,8 @@ class ClassifierTrainer:
             self.params['snapshot_interval'] = snapshot_interval
         if snapshot_exec_template is not None:
             self.params['snapshot_exec_template'] = snapshot_exec_template
+        if self.params['weight_decay'] > 0:
+            self.params['weight_decay'] = self.params['weight_decay'] / data_loader.dataset.n_eff
 
         self.model = model
         self.loader = data_loader
@@ -68,7 +74,8 @@ class ClassifierTrainer:
 
         self.optimizer = self.optimizer_type(
             params=self.model.parameters(),
-            lr=self.params['lr'], weight_decay=self.params['weight_decay'])
+            lr=self.params['lr'],
+            weight_decay=self.params['weight_decay'])
 
     def train(self, steps=1e8):
         self.model.train()
