@@ -23,6 +23,7 @@ class DiscriminativeRNN(nn.Module):
         }
         if dims is not None:
             self.dims.update(dims)
+        self.dims.setdefault('input', self.dims['alphabet'])
 
         self.hyperparams: Dict[str, Dict[str, Union[int, bool, float, str, Sequence]]] = {
             'rnn': {
@@ -52,14 +53,14 @@ class DiscriminativeRNN(nn.Module):
                 'l2_lambda': 1.,
                 'bayesian': False,  # if True, disables l2 regularization
                 'bayesian_lambda': 0.1,
-                'rho_type': 'rho',  # rho, log_sigma
+                'rho_type': 'log_sigma',  # lin_sigma, log_sigma
                 'prior_type': 'gaussian',  # gaussian, scale_mix_gaussian
                 'prior_params': None,
             },
             'optimization': {
                 'optimizer': 'Adam',
                 'lr': 0.001,
-                'weight_decay': 0,  # trainer divides by n_eff before using
+                'weight_decay': 0,  # trainer will divide by n_eff before using
                 'clip': 10.0,
             }
         }
@@ -76,8 +77,10 @@ class DiscriminativeRNN(nn.Module):
                 self.hyperparams['regularization']['prior_params'] = (0., 1.)
             elif self.hyperparams['regularization']['prior_type'] == 'scale_mix_gaussian':
                 self.hyperparams['regularization']['prior_params'] = (0.1, 0., 1., 0., 0.001)
-        if self.hyperparams['regularization']['bayesian'] and \
-                self.hyperparams['rnn']['dropout_p'] > 0 or self.hyperparams['rnn']['dropout_p'] > 0:
+        if self.hyperparams['regularization']['bayesian'] and (
+            self.hyperparams['rnn']['dropout_p'] > 0 or
+            self.hyperparams['dense']['dropout_p'] > 0
+        ):
             warnings.warn("Using both weight uncertainty and dropout")
 
         # Initialize RNN modules
@@ -93,7 +96,7 @@ class DiscriminativeRNN(nn.Module):
             bayesian_params = None
 
         self.rnn = rnn(
-            input_size=self.dims['alphabet'], hidden_size=rnn_params['hidden_size'],
+            input_size=self.dims['input'], hidden_size=rnn_params['hidden_size'],
             num_layers=rnn_params['num_layers'], batch_first=True,
             bidirectional=rnn_params['bidirectional'], dropout=rnn_params['dropout_p'],
             hyperparams=bayesian_params,
@@ -176,7 +179,7 @@ class DiscriminativeRNN(nn.Module):
         # hiddens: (batch, num_directions * hidden_size)
         rnn_params = self.hyperparams['rnn']
         if rnn_params['use_output'] == 'global_avg':
-            # average over output states
+            # average over masked output states
             hiddens = (out_states * input_masks).sum(1) / input_masks.sum(1)
         else:
             # get top layer's hidden state

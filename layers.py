@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 import torch.distributions as dist
 
-from functions import anneal, rsample, kl_normal, mle_mixture_gaussians, log_one_plus_exp
+from functions import anneal, rsample, kl_normal, mle_mixture_gaussians
 
 
 class HyperparameterError(ValueError):
@@ -17,13 +17,13 @@ class GaussianWeightUncertainty(object):
     See also https://www.nitarshan.com/bayes-by-backprop/"""
     def __init__(self, name, hyperparams):
         self.name = name
-        self.rho_type = hyperparams['rho_type']  # rho, log_sigma
+        self.rho_type = hyperparams['rho_type']  # lin_sigma, log_sigma
         self.prior_type = hyperparams['prior_type']  # gaussian, scale_mix_gaussian
         self.prior_params = hyperparams['prior_params']
 
     def rho_to_sigma(self, rho):
-        if self.rho_type == 'rho':
-            return log_one_plus_exp(rho)
+        if self.rho_type == 'lin_sigma':
+            return F.softplus(rho)
         elif self.rho_type == 'log_sigma':
             return rho.exp()
 

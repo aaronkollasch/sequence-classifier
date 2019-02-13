@@ -6,12 +6,10 @@ from sklearn.metrics import roc_auc_score
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 import torch.utils.data
 
 from data_loaders import GeneratorDataLoader
 from model_logging import Logger
-from utils import temp_seed
 
 
 class ClassifierTrainer:
@@ -220,6 +218,10 @@ class ClassifierTrainer:
     def save_state(self, last_batch=None):
         snapshot = f"{self.params['snapshot_path']}/{self.params['snapshot_name']}_{self.model.step}.pth"
         revive_exec = f"{self.params['snapshot_path']}/revive_executable/{self.params['snapshot_name']}.sh"
+        if not os.path.exists(os.path.dirname(snapshot)):
+            os.makedirs(os.path.dirname(snapshot), exist_ok=True)
+        if not os.path.exists(os.path.dirname(revive_exec)):
+            os.makedirs(os.path.dirname(revive_exec), exist_ok=True)
         torch.save(
             {
                 'step': self.model.step,
@@ -229,6 +231,7 @@ class ClassifierTrainer:
                 'model_hyperparams': self.model.hyperparams,
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'train_params': self.params,
+                'dataset_params': self.loader.dataset.params,
                 'last_batch': last_batch
             },
             snapshot

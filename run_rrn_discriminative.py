@@ -23,6 +23,8 @@ parser.add_argument("--num-layers", type=int, default=None,
                     help="Number of RNN layers.")
 parser.add_argument("--num-iterations", type=int, default=250005,
                     help="Number of iterations to run the model.")
+parser.add_argument("--batch-size", type=int, default=32,
+                    help="Batch size.")
 parser.add_argument("--dataset", type=str, default=None,
                     help="Dataset name for fitting model. Alignment weights must be computed beforehand.")
 parser.add_argument("--num-data-workers", type=int, default=4,
@@ -32,9 +34,9 @@ parser.add_argument("--restore", type=str, default=None,
 parser.add_argument("--r-seed", type=int, default=42,
                     help="Random seed")
 parser.add_argument("--dropout-p-rnn", type=float, default=None,
-                    help="Dropout probability (p of zeroing an element, not retention)")
+                    help="Dropout probability (drop rate, not keep rate)")
 parser.add_argument("--dropout-p-dense", type=float, default=None,
-                    help="Dropout probability (p of zeroing an element, not retention)")
+                    help="Dropout probability (drop rate, not keep rate)")
 parser.add_argument("--no-cuda", action='store_true',
                     help="Disable GPU training")
 args = parser.parse_args()
@@ -88,18 +90,8 @@ print()
 
 print("Run:", run_name)
 
-# Variables for runtime modification
-batch_size = 30
-num_iterations = args.num_iterations
-
-plot_train = 100
-
-# fitness_check = 2
-# fitness_start = 2
-# num_iterations = 36
-
 dataset = data_loaders.IPISequenceDataset(
-    batch_size=batch_size,
+    batch_size=args.batch_size,
     working_dir=data_dir,
     dataset=args.dataset,
     matching=True,
@@ -126,7 +118,7 @@ if args.restore is not None:
 else:
     checkpoint = args.restore
     trainer_params = None
-    dims = {'alphabet': dataset.input_dim}
+    dims = {'input': dataset.input_dim}
     hyperparams = {'rnn': {}, 'dense': {}}
     for param_name_1, param_name_2, param in (
             ('rnn', 'hidden_size', args.hidden_size),
@@ -163,4 +155,4 @@ print("Hyperparameters:", json.dumps(model.hyperparams, indent=4))
 print("Training parameters:", json.dumps(trainer.params, indent=4))
 print("Num trainable parameters:", model.parameter_count())
 
-trainer.train(steps=num_iterations)
+trainer.train(steps=args.num_iterations)

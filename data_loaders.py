@@ -1,6 +1,7 @@
 import os
 import glob
 import math
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -37,6 +38,17 @@ class GeneratorDataset(data.Dataset):
     ):
         self.batch_size = batch_size
         self.unlimited_epoch = unlimited_epoch
+
+    @property
+    def params(self):
+        return {"batch_size": self.batch_size, "unlimited_epoch": self.unlimited_epoch}
+
+    @params.setter
+    def params(self, d):
+        if 'batch_size' in d:
+            self.batch_size = d['batch_size']
+        if 'unlimited_epoch' in d:
+            self.unlimited_epoch = d['unlimited_epoch']
 
     @property
     def n_eff(self):
@@ -108,23 +120,50 @@ class SequenceDataset(GeneratorDataset):
         if output_shape not in self.supported_output_shapes:
             raise KeyError(f'Unsupported output shape: {output_shape}')
 
-        # Load up the alphabet type to use, whether that be DNA, RNA, or protein
-        if self.alphabet_type == 'protein':
-            self.alphabet = PROTEIN_ALPHABET
-            self.reorder_alphabet = PROTEIN_REORDERED_ALPHABET
-        elif self.alphabet_type == 'RNA':
-            self.alphabet = RNA_ALPHABET
-            self.reorder_alphabet = RNA_ALPHABET
-        elif self.alphabet_type == 'DNA':
-            self.alphabet = DNA_ALPHABET
-            self.reorder_alphabet = DNA_ALPHABET
-
         # Make a dictionary that goes from aa to a number for one-hot
         self.aa_dict = {}
         self.idx_to_aa = {}
         for i, aa in enumerate(self.alphabet):
             self.aa_dict[aa] = i
             self.idx_to_aa[i] = aa
+
+    @property
+    def params(self):
+        params = super(SequenceDataset, self).params
+        params.update({
+            "alphabet_type": self.alphabet_type,
+            "reverse": self.reverse,
+            "matching": self.matching
+        })
+        return params
+
+    @params.setter
+    def params(self, d):
+        GeneratorDataset.params.__set__(self, d)
+        if 'alphabet_type' in d and d['alphabet_type'] != self.alphabet_type:
+            warnings.warn(f"Cannot change alphabet type from {d['alphabet_type']} to {self.alphabet_type}")
+        if 'reverse' in d:
+            self.reverse = d['reverse']
+        if 'matching' in d:
+            self.matching = d['matching']
+
+    @property
+    def alphabet(self):
+        if self.alphabet_type == 'protein':
+            return PROTEIN_ALPHABET
+        elif self.alphabet_type == 'RNA':
+            return RNA_ALPHABET
+        elif self.alphabet_type == 'DNA':
+            return DNA_ALPHABET
+
+    @property
+    def reorder_alphabet(self):
+        if self.alphabet_type == 'protein':
+            return PROTEIN_REORDERED_ALPHABET
+        elif self.alphabet_type == 'RNA':
+            return RNA_ALPHABET
+        elif self.alphabet_type == 'DNA':
+            return DNA_ALPHABET
 
     @property
     def n_eff(self):
@@ -480,6 +519,9 @@ class DoubleWeightedNanobodyDataset(SequenceDataset):
 
 
 class IPISequenceDataset(SequenceDataset, TrainTestDataset):
+    IPI_VL_SEQS = ['VK1-39', 'VL1-51', 'VK3-15']
+    IPI_VH_SEQS = ['VH1-46', 'VH1-69', 'VH3-7', 'VH3-15', 'VH4-39', 'VH5-51']
+
     def __init__(
             self,
             dataset='',
@@ -493,6 +535,8 @@ class IPISequenceDataset(SequenceDataset, TrainTestDataset):
             comparisons=(('Aff1', 'PSR1', 0., 0.),),  # before, after, thresh_before, thresh_after
             train_test_split=1.0,
             split_seed=42,
+            include_vl=False,
+            include_vh=False,
     ):
         SequenceDataset.__init__(
             self,
@@ -509,10 +553,12 @@ class IPISequenceDataset(SequenceDataset, TrainTestDataset):
         self.comparisons = comparisons
         self.train_test_split = train_test_split
         self.split_seed = split_seed
+        self.include_vl = include_vl
+        self.include_vh = include_vh
 
-        self.light_to_idx = {'VK1-39': 0, 'VL1-51': 1, 'VK3-15': 2}
-        self.heavy_to_idx = {'VH1-46': 0, 'VH1-69': 1, 'VH3-7': 2, 'VH3-15': 3, 'VH4-39': 4, 'VH5-51': 5}
-        self.input_dim = len(self.alphabet) + len(self.light_to_idx) + len(self.heavy_to_idx)
+        self.light_to_idx = {vh: i for i, vh in enumerate(self.IPI_VL_SEQS)}
+        self.heavy_to_idx = {vh: i for i, vh in enumerate(self.IPI_VH_SEQS)}
+        # self.input_dim = len(self.alphabet) + len(self.light_to_idx) + len(self.heavy_to_idx)
 
         self.cdr_to_output = {}
         self.cdr_to_heavy = {}
@@ -523,6 +569,32 @@ class IPISequenceDataset(SequenceDataset, TrainTestDataset):
         self.comparison_pos_weights = torch.ones(len(comparisons))
 
         self.load_data()
+
+    @property
+    def input_dim(self):
+        input_dim = len(self.alphabet)
+        if self.include_vl:
+            input_dim += len(self.light_to_idx)
+        if self.include_vh:
+            input_dim += len(self.heavy_to_idx)
+        return input_dim
+
+    @property
+    def params(self):
+        params = super(IPISequenceDataset, self).params
+        params.update({
+            "include_vl": self.include_vl,
+            "include_vh": self.include_vh,
+        })
+        return params
+
+    @params.setter
+    def params(self, d):
+        SequenceDataset.params.__set__(self, d)
+        if 'include_vl' in d:
+            self.include_vl = d['include_vl']
+        if 'include_vh' in d:
+            self.include_vh = d['include_vh']
 
     def load_data(self):
         seq_col = 'CDR3'
@@ -603,8 +675,11 @@ class IPISequenceDataset(SequenceDataset, TrainTestDataset):
                 light_arr[i, j, self.cdr_to_light[cdr]] = 1.
                 heavy_arr[i, j, self.cdr_to_heavy[cdr]] = 1.
 
-        input_arr = torch.cat([seq_arr, light_arr, heavy_arr], dim=-1)
-        return {'input': input_arr, 'mask': seq_mask}
+        if self.include_vl:
+            seq_arr = torch.cat([seq_arr, light_arr], dim=-1)
+        if self.include_vh:
+            seq_arr = torch.cat([seq_arr, heavy_arr], dim=-1)
+        return {'input': seq_arr, 'mask': seq_mask}
 
     def __getitem__(self, index):
         if self.unlimited_epoch:
