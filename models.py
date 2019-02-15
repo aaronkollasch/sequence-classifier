@@ -2,12 +2,14 @@ from collections import OrderedDict
 from typing import Union, Dict, Sequence
 import warnings
 from copy import deepcopy
+import itertools
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from functions import Nonlinearity, l2_normalize
+from functions import Nonlinearity, l2_normalize, clamp
 from utils import recursive_update
 import layers
 
@@ -48,18 +50,6 @@ class RNN(nn.Module):
 
     def parameter_count(self):
         return sum(param.numel() for param in self.parameters())
-
-    @staticmethod
-    def predict(logits, threshold=0.5):
-        return (logits.sigmoid() > threshold).float()
-
-    @staticmethod
-    def calculate_accuracy(logits, targets, threshold=0.5, reduction='mean'):
-        error = 1 - (targets - (logits.sigmoid() > threshold).float()).abs()
-        if reduction == 'mean':
-            return error.mean()
-        else:
-            return error
 
 
 class DiscriminativeRNN(RNN):
@@ -242,6 +232,18 @@ class DiscriminativeRNN(RNN):
             'ce_loss': ce_loss
         }
 
+    @staticmethod
+    def predict(logits, threshold=0.5):
+        return (logits.sigmoid() > threshold).float()
+
+    @staticmethod
+    def calculate_accuracy(logits, targets, threshold=0.5, reduction='mean'):
+        error = 1 - (targets - (logits.sigmoid() > threshold).float()).abs()
+        if reduction == 'mean':
+            return error.mean()
+        else:
+            return error
+
 
 class GenerativeRNN(RNN):
     """Implementation of generative RNN
@@ -367,6 +369,8 @@ class GenerativeRNN(RNN):
         self.dense_net = nn.Sequential(dense_net)
 
         self._enable_gradient = 'redb'
+        self._count_labels = torch.zeros(emb_params['features'])
+        self._label_count = 0
 
     @property
     def enable_gradient(self):
@@ -412,6 +416,16 @@ class GenerativeRNN(RNN):
         h0 = torch.zeros(num_layers, batch_size, rnn_params['hidden_size']).to(device)
         # c0 = torch.zeros(rnn_params['num_layers'], batch_size, hidden_size).to(device)  # for use with LSTM model
         return h0
+
+    def p_labels(self):
+        """
+
+        :return: tensor(n_labels)
+        """
+        if self._label_count == 0:
+            return None
+        else:
+            return self._count_labels / self._label_count
 
     def weight_costs(self):
         return (
@@ -494,10 +508,13 @@ class GenerativeRNN(RNN):
         reconstruction_loss = self.reconstruction_loss(
             seq_logits, target_seqs, mask
         )
-        if labels is not None and pos_weight is not None:
-            weights_per_seq = (labels * pos_weight.unsqueeze(0) + (1-labels)).prod(1)
-            loss_per_seq = reconstruction_loss['ce_loss_per_seq'] * weights_per_seq
-            loss = loss_per_seq.mean()
+        if labels is not None:
+            self._count_labels += labels.detach().sum(0)
+            self._label_count += labels.size(0)
+            if pos_weight is not None:
+                weights_per_seq = (labels * pos_weight.unsqueeze(0) + (1-labels)).prod(1)
+                loss_per_seq = reconstruction_loss['ce_loss_per_seq'] * weights_per_seq
+                loss = loss_per_seq.mean()
         else:
             loss_per_seq = reconstruction_loss['ce_loss_per_seq']
             loss = reconstruction_loss['ce_loss']
@@ -528,3 +545,76 @@ class GenerativeRNN(RNN):
         }
         output.update(reconstruction_loss)
         return output
+
+    def predict_all_y(self, inputs, input_masks, outputs):
+        """Get p(x|y)p(y) for all possible y
+
+        :return: (n_batch, n_choices), (n_choices, n_features)
+        """
+        n_batch = inputs.size(0)
+        seq_len = inputs.size(1)
+        n_features = self.hyperparams['label_embedding']['features']
+
+        self.hidden = self.init_hidden(n_batch, inputs.device)
+        x = inputs * input_masks
+
+        # out_states: (batch, seq_len, num_directions * hidden_size)
+        out_states, self.hidden = self.rnn(x, self.hidden, step=self.step)
+
+        # y_choices: (n_choices, n_features)
+        y_choices = torch.Tensor(
+            [i for i in itertools.product([0., 1.], repeat=n_features)],
+            device=inputs.device
+        )
+
+        # p_labels: (n_features, [p_0, p_1])
+        p_labels = self.p_labels()
+        p_labels = torch.stack([1-p_labels, p_labels]).transpose(0, 1)
+
+        # p_y_choices: (n_choices)
+        p_y_choices = (torch.eye(2, device=inputs.device)[y_choices.long()] * p_labels.unsqueeze(0))
+        p_y_choices = p_y_choices.sum(2).clamp_min(1e-6).log().sum(1)
+
+        log_probs = []
+        for y, p_y in zip(y_choices, p_y_choices):
+            label_embedding = self.label_embedding(y)
+            hiddens = torch.cat([
+                out_states,
+                label_embedding.unsqueeze(0).unsqueeze(1).expand(n_batch, seq_len, -1)
+            ], -1)
+            output_logits = self.dense_net(hiddens)
+
+            # calculate p(x|y)p(y)
+            log_probs.append((output_logits.log_softmax(2) * outputs).sum([1, 2]) + p_y)
+
+        log_probs = torch.stack(log_probs, 1)
+        return log_probs, y_choices
+
+    @staticmethod
+    def predict_logits(log_probs, y_choices):
+        """Estimate logits for p(y|x)
+        by subtracting logits for negative choices
+        from logits for positive choices for each feature.
+        Estimate is inaccurate when n_features > 1.
+
+        :return: (n_batch, n_features)
+        """
+        return (log_probs.unsqueeze(2) * (2 * y_choices - 1).unsqueeze(0)).sum(1)
+
+    @staticmethod
+    def predict(log_probs, y_choices):
+        """Get max_y(p(x|y)p(y)
+
+        :return: (n_batch, n_features)
+        """
+        best_y = log_probs.argmax(1)
+        predictions = y_choices[best_y]
+        return predictions
+
+    @staticmethod
+    def calculate_accuracy(logits, targets, threshold=0.5, reduction='mean'):
+        error = 1 - (targets - (logits.sigmoid() > threshold).float()).abs()
+        if reduction == 'mean':
+            return error.mean()
+        else:
+            return error

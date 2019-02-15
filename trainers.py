@@ -5,10 +5,11 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data
 
-from data_loaders import GeneratorDataLoader
+from data_loaders import GeneratorDataLoader, IPITrainTestDataset
 from model_logging import Logger
 
 
@@ -152,7 +153,7 @@ class ClassifierTrainer:
 
                 true_outputs.append(batch['label'])
                 logits.append(output_logits)
-                losses.append(loss_dict['loss'])
+                losses.append(loss_dict['ce_loss'])
                 accuracies.append(error)
 
             true_outputs = torch.cat(true_outputs, 0).cpu().numpy()
@@ -373,7 +374,8 @@ class GenerativeClassifierTrainer:
             #     loss.detach(), ce_loss.detach(), bitperchar.detach()), flush=True)
 
     def validate(self):
-        return None
+        if not isinstance(self.loader.dataset, IPITrainTestDataset):
+            return None
         self.model.eval()
         self.loader.dataset.test()
         self.loader.dataset.unlimited_epoch = False
@@ -381,7 +383,6 @@ class GenerativeClassifierTrainer:
         with torch.no_grad():
             loader = GeneratorDataLoader(self.loader.dataset, num_workers=self.loader.num_workers)
             pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
-            n_eff = len(self.loader.dataset.cdr_seqs_train)
 
             true_outputs = []
             logits = []
@@ -390,16 +391,18 @@ class GenerativeClassifierTrainer:
             for batch in loader:
                 for key in batch.keys():
                     batch[key] = batch[key].to(self.device, non_blocking=True)
-                output_logits = self.model(batch['input'], batch['mask'])
 
-                loss_dict = self.model.calculate_loss(
-                    output_logits, batch['label'], n_eff=n_eff, pos_weight=pos_weights, reduction='none')
+                log_probs, y_choices = self.model.predict_all_y(batch['input'], batch['mask'], batch['decoder_output'])
+                output_logits = self.model.predict_logits(log_probs, y_choices)
+
                 error = self.model.calculate_accuracy(
                     output_logits, batch['label'], reduction='none')
+                ce_loss = F.binary_cross_entropy_with_logits(
+                    output_logits, batch['label'], pos_weight=pos_weights, reduction='none')
 
                 true_outputs.append(batch['label'])
                 logits.append(output_logits)
-                losses.append(loss_dict['loss'])
+                losses.append(ce_loss)
                 accuracies.append(error)
 
             true_outputs = torch.cat(true_outputs, 0).cpu().numpy()
@@ -492,9 +495,9 @@ class GenerativeClassifierTrainer:
     def load_state(self, checkpoint, map_location=None):
         if not isinstance(checkpoint, dict):
             checkpoint = torch.load(checkpoint, map_location=map_location)
-        if self.model.model_type != checkpoint['model_type']:
+        if self.model.MODEL_TYPE != checkpoint['model_type']:
             print("Warning: model type mismatch: loaded type {} for model type {}".format(
-                checkpoint['model_type'], self.model.model_type
+                checkpoint['model_type'], self.model.MODEL_TYPE
             ))
         if self.model.hyperparams != checkpoint['model_hyperparams']:
             print("Warning: model hyperparameter mismatch")

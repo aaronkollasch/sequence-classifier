@@ -104,25 +104,51 @@ print()
 
 print("Run:", args.run_name)
 
-dataset = data_loaders.VHClusteredAntibodyDataset(
-    batch_size=args.batch_size,
-    working_dir=data_dir,
-    dataset=args.dataset,
-    matching=True,
-    unlimited_epoch=True,
-    include_vh=args.include_vh,
-    for_decoder=True
-)
-loader = data_loaders.GeneratorDataLoader(
-    dataset,
-    num_workers=args.num_data_workers,
-    pin_memory=True,
-    worker_init_fn=_init_fn
-)
+
+def get_dataset(step=0):
+    if step < args.num_iterations:
+        _dataset = data_loaders.VHClusteredAntibodyDataset(
+            batch_size=args.batch_size,
+            working_dir=data_dir,
+            dataset=args.dataset,
+            matching=True,
+            unlimited_epoch=True,
+            include_vh=args.include_vh,
+            for_decoder=True
+        )
+        _loader = data_loaders.GeneratorDataLoader(
+            _dataset,
+            num_workers=args.num_data_workers,
+            pin_memory=True,
+            worker_init_fn=_init_fn
+        )
+        return _dataset, _loader
+    else:
+        _dataset = data_loaders.IPITrainTestDataset(
+            batch_size=args.batch_size,
+            working_dir=working_dir,
+            dataset=args.labeled_dataset,
+            train_test_split=0.9,
+            comparisons=(('Aff1', 'PSR1', 2., 2.),),
+            matching=True,
+            unlimited_epoch=True,
+            include_vl=False,
+            include_vh=args.include_vh,
+            for_decoder=True
+        )
+        _loader = data_loaders.GeneratorDataLoader(
+            _dataset,
+            num_workers=args.num_data_workers,
+            pin_memory=True,
+            worker_init_fn=_init_fn
+        )
+        return _dataset, _loader
+
 
 if args.restore is not None:
     print("Restoring model from:", args.restore)
     checkpoint = torch.load(args.restore, map_location='cpu' if device.type == 'cpu' else None)
+    dataset, loader = get_dataset(checkpoint['step'])
     dims = checkpoint['model_dims']
     hyperparams = checkpoint['model_hyperparams']
     trainer_params = checkpoint['train_params']
@@ -132,6 +158,7 @@ if args.restore is not None:
         hyperparams['dense']['dropout_p'] = args.dropout_p_dense
     model = models.GenerativeRNN(dims=dims, hyperparams=hyperparams)
 else:
+    dataset, loader = get_dataset()
     checkpoint = args.restore
     trainer_params = None
     dims = {'input': dataset.input_dim}
@@ -179,30 +206,13 @@ if model.step < args.num_iterations:
             p.data.zero_()
     model.enable_gradient = 'rd'
     trainer.train(steps=args.num_iterations)
+    del dataset
+    del loader
+    del trainer.loader
+    dataset, loader = get_dataset(model.step)
+    trainer.loader = loader
 
-del dataset
-del loader
-del trainer.loader
-dataset = data_loaders.IPITrainTestDataset(
-    batch_size=args.batch_size,
-    working_dir=data_dir,
-    dataset=args.labeled_dataset,
-    train_test_split=0.9,
-    comparisons=(('Aff1', 'PSR1', 2., 2.),),
-    matching=True,
-    unlimited_epoch=True,
-    include_vl=False,
-    include_vh=args.include_vh,
-    for_decoder=True
-)
-loader = data_loaders.GeneratorDataLoader(
-    dataset,
-    num_workers=args.num_data_workers,
-    pin_memory=True,
-    worker_init_fn=_init_fn
-)
-trainer.loader = loader
 trainer.params['snapshot_interval'] = args.num_labeled_iterations // 1
-model.enable_gradient = 'eb'
+model.enable_gradient = 'edb'
 # print("Dataset parameters:", json.dumps(dataset.params, indent=4))
 trainer.train(steps=args.num_iterations + args.num_labeled_iterations)
