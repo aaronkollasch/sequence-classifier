@@ -133,7 +133,8 @@ class SequenceDataset(GeneratorDataset):
         params.update({
             "alphabet_type": self.alphabet_type,
             "reverse": self.reverse,
-            "matching": self.matching
+            "matching": self.matching,
+            "output_shape": self.output_shape,
         })
         return params
 
@@ -146,6 +147,8 @@ class SequenceDataset(GeneratorDataset):
             self.reverse = d['reverse']
         if 'matching' in d:
             self.matching = d['matching']
+        if 'output_shape' in d:
+            self.output_shape = d['output_shape']
 
     @property
     def alphabet(self):
@@ -518,9 +521,10 @@ class DoubleWeightedNanobodyDataset(SequenceDataset):
         return batch
 
 
-class IPISequenceDataset(SequenceDataset, TrainTestDataset):
+class AntibodySequenceDataset(SequenceDataset):
     IPI_VL_SEQS = ['VK1-39', 'VL1-51', 'VK3-15']
     IPI_VH_SEQS = ['VH1-46', 'VH1-69', 'VH3-7', 'VH3-15', 'VH4-39', 'VH5-51']
+    LABELED = False
 
     def __init__(
             self,
@@ -531,12 +535,10 @@ class IPISequenceDataset(SequenceDataset, TrainTestDataset):
             alphabet_type='protein',
             reverse=False,
             matching=False,
-            output_shape='NCHW',
-            comparisons=(('Aff1', 'PSR1', 0., 0.),),  # before, after, thresh_before, thresh_after
-            train_test_split=1.0,
-            split_seed=42,
+            output_shape='NLC',
             include_vl=False,
             include_vh=False,
+            for_decoder=False,
     ):
         SequenceDataset.__init__(
             self,
@@ -547,28 +549,28 @@ class IPISequenceDataset(SequenceDataset, TrainTestDataset):
             matching=matching,
             output_shape=output_shape,
         )
-        TrainTestDataset.__init__(self)
         self.dataset = dataset
         self.working_dir = working_dir
-        self.comparisons = comparisons
-        self.train_test_split = train_test_split
-        self.split_seed = split_seed
         self.include_vl = include_vl
         self.include_vh = include_vh
+        self.for_decoder = for_decoder
 
-        self.light_to_idx = {vh: i for i, vh in enumerate(self.IPI_VL_SEQS)}
-        self.heavy_to_idx = {vh: i for i, vh in enumerate(self.IPI_VH_SEQS)}
-        # self.input_dim = len(self.alphabet) + len(self.light_to_idx) + len(self.heavy_to_idx)
+        self.vl_list = self.IPI_VL_SEQS.copy()
+        self.vh_list = self.IPI_VH_SEQS.copy()
 
-        self.cdr_to_output = {}
-        self.cdr_to_heavy = {}
-        self.cdr_to_light = {}
-        self.all_cdr_seqs = []
-        self.cdr_seqs_train = []
-        self.cdr_seqs_test = []
-        self.comparison_pos_weights = torch.ones(len(comparisons))
+    @property
+    def light_to_idx(self):
+        if self.vh_list is None:
+            raise RuntimeError("VL list not loaded.")
+        else:
+            return {vh: i for i, vh in enumerate(self.vl_list)}
 
-        self.load_data()
+    @property
+    def heavy_to_idx(self):
+        if self.vh_list is None:
+            raise RuntimeError("VH list not loaded.")
+        else:
+            return {vh: i for i, vh in enumerate(self.vh_list)}
 
     @property
     def input_dim(self):
@@ -581,10 +583,13 @@ class IPISequenceDataset(SequenceDataset, TrainTestDataset):
 
     @property
     def params(self):
-        params = super(IPISequenceDataset, self).params
+        params = super(AntibodySequenceDataset, self).params
         params.update({
             "include_vl": self.include_vl,
             "include_vh": self.include_vh,
+            "vl_seqs": self.vl_list,
+            "vh_seqs": self.vh_list,
+            "for_decoder": self.for_decoder,
         })
         return params
 
@@ -595,6 +600,111 @@ class IPISequenceDataset(SequenceDataset, TrainTestDataset):
             self.include_vl = d['include_vl']
         if 'include_vh' in d:
             self.include_vh = d['include_vh']
+        if 'vl_seqs' in d:
+            self.vl_list = d['vl_seqs']
+        if 'vh_seqs' in d:
+            self.vh_list = d['vh_seqs']
+        if 'for_decoder' in d:
+            self.for_decoder = d['for_decoder']
+
+    def sequences_to_onehot(self, sequences, vls=None, vhs=None, reverse=None, matching=None):
+        num_seqs = len(sequences)
+        max_seq_len = max(len(seq) for seq in sequences)
+        if self.for_decoder:
+            max_seq_len += 1
+
+        seq_arr = torch.zeros(num_seqs, max_seq_len, len(self.alphabet))
+        seq_output_arr = torch.zeros(num_seqs, max_seq_len, len(self.alphabet))
+        seq_mask = torch.zeros(num_seqs, max_seq_len, 1)
+        if self.include_vl:
+            light_arr = torch.zeros(num_seqs, max_seq_len, len(self.light_to_idx))
+        if self.include_vh:
+            heavy_arr = torch.zeros(num_seqs, max_seq_len, len(self.heavy_to_idx))
+
+        for i, cdr in enumerate(sequences):
+            if cdr[0] == 'C':
+                cdr = cdr[1:]
+            if self.for_decoder:
+                cdr_out = cdr + '*'
+                cdr = '*' + cdr
+            for j, aa in enumerate(cdr):
+                seq_arr[i, j, self.aa_dict[aa]] = 1.
+                if self.for_decoder:
+                    seq_output_arr[i, j, self.aa_dict[cdr_out[j]]] = 1.
+                seq_mask[i, j, 0] = 1.
+                if self.include_vl:
+                    light_arr[i, j, self.light_to_idx[vls[i]]] = 1.
+                if self.include_vl:
+                    heavy_arr[i, j, self.heavy_to_idx[vhs[i]]] = 1.
+
+        if self.include_vl:
+            seq_arr = torch.cat([seq_arr, light_arr], dim=-1)
+        if self.include_vh:
+            seq_arr = torch.cat([seq_arr, heavy_arr], dim=-1)
+        output = {'input': seq_arr, 'mask': seq_mask}
+        if self.for_decoder:
+            output['decoder_output'] = seq_output_arr
+        return output
+
+    @property
+    def n_eff(self):
+        raise NotImplementedError
+
+    def __getitem__(self, item):
+        raise NotImplementedError
+
+
+class IPITrainTestDataset(AntibodySequenceDataset, TrainTestDataset):
+    LABELED = True
+
+    def __init__(
+            self,
+            dataset='',
+            working_dir='.',
+            batch_size=32,
+            unlimited_epoch=True,
+            alphabet_type='protein',
+            reverse=False,
+            matching=False,
+            output_shape='NLC',
+            comparisons=(('Aff1', 'PSR1', 0., 0.),),  # before, after, thresh_before, thresh_after
+            train_test_split=1.0,
+            split_seed=42,
+            include_vl=False,
+            include_vh=False,
+            for_decoder=False,
+    ):
+        AntibodySequenceDataset.__init__(
+            self,
+            batch_size=batch_size,
+            unlimited_epoch=unlimited_epoch,
+            alphabet_type=alphabet_type,
+            reverse=reverse,
+            matching=matching,
+            output_shape=output_shape,
+            include_vl=include_vl,
+            include_vh=include_vh,
+            for_decoder=for_decoder,
+        )
+        TrainTestDataset.__init__(self)
+        self.dataset = dataset
+        self.working_dir = working_dir
+        self.comparisons = comparisons
+        self.train_test_split = train_test_split
+        self.split_seed = split_seed
+        self.include_vl = include_vl
+        self.include_vh = include_vh
+        self.for_decoder = for_decoder
+
+        self.cdr_to_output = {}
+        self.cdr_to_heavy = {}
+        self.cdr_to_light = {}
+        self.all_cdr_seqs = []
+        self.cdr_seqs_train = []
+        self.cdr_seqs_test = []
+        self.comparison_pos_weights = torch.ones(len(comparisons))
+
+        self.load_data()
 
     def load_data(self):
         seq_col = 'CDR3'
@@ -645,8 +755,8 @@ class IPISequenceDataset(SequenceDataset, TrainTestDataset):
             self.cdr_to_output[cdr] = output
 
         df = df.set_index(seq_col)
-        self.cdr_to_heavy = df[heavy_col].apply(self.heavy_to_idx.get).to_dict()
-        self.cdr_to_light = df[light_col].apply(self.light_to_idx.get).to_dict()
+        self.cdr_to_heavy = df[heavy_col].to_dict()
+        self.cdr_to_light = df[light_col].to_dict()
 
     @property
     def n_eff(self):
@@ -659,28 +769,6 @@ class IPISequenceDataset(SequenceDataset, TrainTestDataset):
         else:
             return self.cdr_seqs_test
 
-    def sequences_to_onehot(self, sequences, reverse=None, matching=None):
-        num_seqs = len(sequences)
-        max_seq_len = max(len(seq) for seq in sequences)
-
-        seq_arr = torch.zeros(num_seqs, max_seq_len, len(self.alphabet))
-        seq_mask = torch.zeros(num_seqs, max_seq_len, 1)
-        light_arr = torch.zeros(num_seqs, max_seq_len, len(self.light_to_idx))
-        heavy_arr = torch.zeros(num_seqs, max_seq_len, len(self.heavy_to_idx))
-
-        for i, cdr in enumerate(sequences):
-            for j, aa in enumerate(cdr):
-                seq_arr[i, j, self.aa_dict[aa]] = 1.
-                seq_mask[i, j, 0] = 1.
-                light_arr[i, j, self.cdr_to_light[cdr]] = 1.
-                heavy_arr[i, j, self.cdr_to_heavy[cdr]] = 1.
-
-        if self.include_vl:
-            seq_arr = torch.cat([seq_arr, light_arr], dim=-1)
-        if self.include_vh:
-            seq_arr = torch.cat([seq_arr, heavy_arr], dim=-1)
-        return {'input': seq_arr, 'mask': seq_mask}
-
     def __getitem__(self, index):
         if self.unlimited_epoch:
             indices = np.random.randint(0, self.n_eff, self.batch_size)
@@ -690,13 +778,281 @@ class IPISequenceDataset(SequenceDataset, TrainTestDataset):
             indices = np.arange(first_index, last_index)
 
         seqs = self.cdr_seqs[indices].tolist()
-        output_arr = torch.zeros(len(indices), len(self.comparisons))
+        label_arr = torch.zeros(len(indices), len(self.comparisons))
         for i, seq in enumerate(seqs):
             for j, output in enumerate(self.cdr_to_output[seq]):
-                output_arr[i, j] = output
+                label_arr[i, j] = output
 
         if len(seqs) == 0:
             return None
-        batch = self.sequences_to_onehot(seqs)
-        batch['output'] = output_arr
+        vls = [self.cdr_to_light[cdr] for cdr in seqs]
+        vhs = [self.cdr_to_heavy[cdr] for cdr in seqs]
+        batch = self.sequences_to_onehot(seqs, vls=vls, vhs=vhs)
+        batch['label'] = label_arr
         return batch
+
+
+class VHAntibodyDataset(AntibodySequenceDataset):
+    """Abstract antibody dataset"""
+    IPI_VH_SEQS = ['IGHV1-46', 'IGHV1-69', 'IGHV3-7', 'IGHV3-15', 'IGHV4-39', 'IGHV5-51']  # TODO IGHV1-69D?
+    LABELED = False
+
+    def __init__(
+            self,
+            batch_size=32,
+            unlimited_epoch=True,
+            alphabet_type='protein',
+            reverse=False,
+            matching=False,
+            output_shape='NLC',
+            include_vh=False,
+            vh_set_name='IPI',
+            for_decoder=True,
+    ):
+        super(VHAntibodyDataset, self).__init__(
+            batch_size=batch_size,
+            unlimited_epoch=unlimited_epoch,
+            alphabet_type=alphabet_type,
+            reverse=reverse,
+            matching=matching,
+            output_shape=output_shape,
+            include_vl=False,
+            include_vh=include_vh,
+            for_decoder=for_decoder,
+        )
+        self.vh_set_name = vh_set_name
+
+        self._n_eff = 1
+        if self.vh_set_name == 'IPI':
+            self.vh_list = self.IPI_VH_SEQS.copy()
+        else:
+            self.vh_list = None
+
+    @property
+    def input_dim(self):
+        input_dim = len(self.alphabet)
+        if self.include_vh:
+            input_dim += len(self.heavy_to_idx)
+        return input_dim
+
+    @property
+    def params(self):
+        params = super(VHAntibodyDataset, self).params
+        params.pop('vl_seqs', None)
+        params.pop('include_vl', None)
+        params.update({
+            "vh_set_name": self.vh_set_name,
+            "vh_seqs": self.vh_list,
+        })
+        return params
+
+    @params.setter
+    def params(self, d):
+        d.pop('vl_seqs', None)
+        d.pop('include_vl', None)
+        AntibodySequenceDataset.params.__set__(self, d)
+        if 'vh_set_name' in d:
+            self.vh_set_name = d['vh_set_name']
+            if self.vh_set_name == 'IPI':
+                self.vh_list = self.IPI_VH_SEQS.copy()
+            else:
+                self.vh_list = None
+        if 'vh_seqs' in d:
+            self.vh_list = d['vh_seqs']
+
+    @property
+    def n_eff(self):
+        """Number of clusters across all VH genes"""
+        return self._n_eff
+
+    def __getitem__(self, index):
+        raise NotImplementedError
+
+
+class VHAntibodyFastaDataset(VHAntibodyDataset):
+    """Antibody dataset with VH sequences.
+    fasta: >seq(:.+)*:VH_gene
+    """
+
+    def __init__(
+            self,
+            dataset='',
+            working_dir='.',
+            batch_size=32,
+            unlimited_epoch=True,
+            alphabet_type='protein',
+            reverse=False,
+            matching=False,
+            output_shape='NLC',
+            include_vh=False,
+            vh_set_name='IPI',
+            for_decoder=True,
+    ):
+        super(VHAntibodyFastaDataset, self).__init__(
+            batch_size=batch_size,
+            unlimited_epoch=unlimited_epoch,
+            alphabet_type=alphabet_type,
+            reverse=reverse,
+            matching=matching,
+            output_shape=output_shape,
+            include_vh=include_vh,
+            vh_set_name=vh_set_name,
+            for_decoder=for_decoder,
+        )
+        self.dataset = dataset
+        self.working_dir = working_dir
+
+        self.names = None
+        self.vh_genes = None
+        self.sequences = None
+
+        self.load_data()
+
+    def load_data(self):
+        filename = os.path.join(self.working_dir, self.dataset)
+        names_list = []
+        vh_genes_list = []
+        sequence_list = []
+
+        with open(filename, 'r') as fa:
+            for i, (title, seq) in enumerate(SimpleFastaParser(fa)):
+                valid = True
+                for letter in seq:
+                    if letter not in self.aa_dict:
+                        valid = False
+                if not valid:
+                    continue
+
+                names_list.append(title)
+                vh_genes_list.append(title.split(':')[-1])
+                sequence_list.append(seq)
+
+        self.names = np.array(names_list)
+        self.vh_genes = np.array(vh_genes_list)
+        self.sequences = np.array(sequence_list)
+
+        print("Number of sequences:", self.n_eff)
+
+    @property
+    def n_eff(self):
+        return len(self.sequences)  # not a true n_eff
+
+    def __getitem__(self, index):
+        """
+        :param index: batch index; ignored if unlimited_epoch
+        :return: batch of size self.batch_size
+        """
+
+        if self.unlimited_epoch:
+            indices = np.random.randint(0, self.n_eff, self.batch_size)
+        else:
+            first_index = index * self.batch_size
+            last_index = min((index + 1) * self.batch_size, self.n_eff)
+            indices = np.arange(first_index, last_index)
+
+        seqs = self.sequences[indices]
+        vhs = self.vh_genes[indices]
+        batch = self.sequences_to_onehot(seqs, vhs=vhs)
+        batch['names'] = self.names[indices]
+        batch['sequences'] = [seq for seq, vh in seqs]
+        return batch
+
+
+class VHClusteredAntibodyDataset(VHAntibodyDataset):
+    """Double-weighted antibody dataset.
+    fasta: >seq:clu1:clu2
+    clu1: VH gene
+    clu2: cluster id
+    """
+
+    def __init__(
+            self,
+            dataset='',
+            working_dir='.',
+            batch_size=32,
+            unlimited_epoch=True,
+            alphabet_type='protein',
+            reverse=False,
+            matching=False,
+            output_shape='NLC',
+            include_vh=False,
+            vh_set_name='IPI',
+            for_decoder=True,
+    ):
+        super(VHClusteredAntibodyDataset, self).__init__(
+            batch_size=batch_size,
+            unlimited_epoch=unlimited_epoch,
+            alphabet_type=alphabet_type,
+            reverse=reverse,
+            matching=matching,
+            output_shape=output_shape,
+            include_vh=include_vh,
+            vh_set_name=vh_set_name,
+            for_decoder=for_decoder,
+        )
+        self.dataset = dataset
+        self.working_dir = working_dir
+
+        self.clu1_to_clu2s = {}
+        self.clu1_to_clu2_to_seqs = {}
+
+        self.load_data()
+
+    @property
+    def clu1_list(self):
+        return self.vh_list
+
+    def load_data(self):
+        filename = self.working_dir + '/datasets/' + self.dataset
+        with open(filename, 'r') as fa:
+            for i, (title, seq) in enumerate(SimpleFastaParser(fa)):
+                name, clu1, clu2 = title.split(':')
+                valid = True
+                for letter in seq:
+                    if letter not in self.aa_dict:
+                        valid = False
+                if not valid:
+                    continue
+
+                if clu1 in self.clu1_to_clu2_to_seqs:
+                    if clu2 in self.clu1_to_clu2_to_seqs[clu1]:
+                        self.clu1_to_clu2_to_seqs[clu1][clu2].append(seq)
+                    else:
+                        self.clu1_to_clu2s[clu1].append(clu2)
+                        self.clu1_to_clu2_to_seqs[clu1][clu2] = [seq]
+                else:
+                    self.clu1_to_clu2s[clu1] = [clu2]
+                    self.clu1_to_clu2_to_seqs[clu1] = {clu2: [seq]}
+
+        if self.clu1_list is None:
+            self.vh_list = list(self.clu1_to_clu2_to_seqs.keys())
+        self._n_eff = sum(len(clu2s) for clu2s in self.clu1_to_clu2s.values())
+        print("Num VH genes:", len(self.clu1_list))
+        print("N_eff:", self.n_eff)
+
+    def __getitem__(self, index):
+        """
+        :param index: ignored
+        :return: batch of size self.batch_size
+        """
+        seqs = []
+        vhs = []
+        for i in range(self.batch_size):
+            # Pick a VH gene
+            clu1_idx = np.random.randint(0, len(self.clu1_list))
+            clu1 = self.clu1_list[clu1_idx]
+
+            # Then pick a cluster for that VH gene
+            clu2_list = self.clu1_to_clu2s[clu1]
+            clu2_idx = np.random.randint(0, len(clu2_list))
+            clu2 = clu2_list[clu2_idx]
+
+            # Then pick a random sequence from the  cluster
+            clu_seqs = self.clu1_to_clu2_to_seqs[clu1][clu2]
+            seq_idx = np.random.randint(0, len(clu_seqs))
+            seqs.append(clu_seqs[seq_idx])
+            vhs.append(clu1)
+
+        batch = self.sequences_to_onehot(seqs, vhs=vhs)
+        return batch
+

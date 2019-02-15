@@ -23,6 +23,7 @@ class Logger:
         self.log_time = time.time()
         self.accumulated_loss = 0
         self.accumulated_accuracy = 0
+        self.accumulated_bitperchar = 0
         self.generate_function = generate_function
         if self.generate_function is not None:
             self.generate_thread = threading.Thread(target=self.generate_function)
@@ -30,12 +31,16 @@ class Logger:
 
     def log(self, current_step, current_losses, current_grad_norm):
         self.accumulated_loss += float(current_losses['loss'].detach())
-        self.accumulated_accuracy += float(current_losses['accuracy'].detach())
+        if 'accuracy' in current_losses:
+            self.accumulated_accuracy += float(current_losses['accuracy'].detach())
+        if 'bitperchar' in current_losses:
+            self.accumulated_bitperchar += float(current_losses['bitperchar'].detach())
         if current_step % self.log_interval == 0:
             self.log_loss(current_step)
             self.log_time = time.time()
             self.accumulated_loss = 0
             self.accumulated_accuracy = 0
+            self.accumulated_bitperchar = 0
         if self.val_interval is not None and self.val_interval > 0 and current_step % self.val_interval == 0:
             self.validate(current_step)
         if self.gen_interval is not None and self.gen_interval > 0 and current_step % self.gen_interval == 0:
@@ -44,11 +49,15 @@ class Logger:
     def log_loss(self, current_step):
         avg_loss = self.accumulated_loss / self.log_interval
         avg_acc = self.accumulated_accuracy / self.log_interval
-        print(f"{time.time()-self.log_time:6.3f} loss, accuracy at step {current_step: 8d}: "
-              f"{avg_loss:10.6f}, {avg_acc:10.6f}", flush=True)
+        avg_bitperchar = self.accumulated_bitperchar / self.log_interval
+        print(f"{time.time()-self.log_time:6.3f} loss, bitperchar, accuracy at step {current_step: 8d}: "
+              f"{avg_loss:10.6f}, {avg_bitperchar:10.6f}, {avg_acc:10.6f}", flush=True)
 
     def validate(self, current_step):
-        losses, accuracies, true_outputs, logits, rocs = self.trainer.validate()
+        validation = self.trainer.validate()
+        if validation is None:
+            return
+        losses, accuracies, true_outputs, logits, rocs = validation
         print(f"validation losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}", flush=True)
         print(f"validation accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}", flush=True)
         # print(f"validation true values: {', '.join(['{:6.4f}'.format(val) for val in true_outputs])}", flush=True)
@@ -86,7 +95,10 @@ class TensorboardLogger(Logger):
         super(TensorboardLogger, self).log(current_step, current_losses, current_grad_norm)
         self.scalar_summary('grad norm', current_grad_norm, current_step)
         self.scalar_summary('loss', current_losses['loss'].detach(), current_step)
-        self.scalar_summary('accuracy', current_losses['accuracy'].detach(), current_step)
+        if 'accuracy' in current_losses:
+            self.scalar_summary('accuracy', current_losses['accuracy'].detach(), current_step)
+        if 'bitperchar' in current_losses:
+            self.scalar_summary('bitperchar', current_losses['bitperchar'].detach(), current_step)
 
     def log_loss(self, current_step):
         # loss
@@ -104,7 +116,10 @@ class TensorboardLogger(Logger):
             self.image_summary(tag, summary['img'], current_step, max_outputs=summary.get('max_outputs', 3))
 
     def validate(self, current_step):
-        losses, accuracies, true_outputs, logits, rocs = self.trainer.validate()
+        validation = self.trainer.validate()
+        if validation is None:
+            return
+        losses, accuracies, true_outputs, logits, rocs = validation
         for i, loss, acc in enumerate(zip(losses, accuracies)):
             self.scalar_summary(f'validation loss {i}', loss, current_step)
             self.scalar_summary(f'validation accuracy {i}', acc, current_step)
