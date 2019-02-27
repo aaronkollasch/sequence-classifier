@@ -1,11 +1,11 @@
 import os
 import glob
 import math
-import warnings
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributions as dist
 import torch.utils.data as data
 from Bio.SeqIO.FastaIO import SimpleFastaParser
 
@@ -97,9 +97,88 @@ class TrainTestDataset(data.Dataset):
         raise NotImplementedError
 
 
+class TrainValTestDataset(data.Dataset):
+    """A Dataset that has training, validation, and testing modes"""
+    def __init__(self):
+        self._mode = 'train'
+
+    def train(self, mode='train'):
+        self._mode = mode
+
+    def val(self):
+        self.train('val')
+
+    def test(self):
+        self.train('test')
+
+    def __getitem__(self, index):
+        raise NotImplementedError
+
+    def __len__(self):
+        raise NotImplementedError
+
+
+def sequences_to_decoder_onehot(
+        sequences, input_char_map, output_char_map, reverse=False, matching=False, start_char='*', end_char='*'):
+    num_seqs = len(sequences)
+    max_seq_len = max([len(seq) for seq in sequences]) + 1
+    decoder_input = np.zeros((num_seqs, len(input_char_map), 1, max_seq_len))
+    decoder_output = np.zeros((num_seqs, len(output_char_map), 1, max_seq_len))
+    decoder_mask = np.zeros((num_seqs, 1, 1, max_seq_len))
+
+    if matching:
+        decoder_input_r = np.zeros((num_seqs, len(input_char_map), 1, max_seq_len))
+        decoder_output_r = np.zeros((num_seqs, len(output_char_map), 1, max_seq_len))
+    else:
+        decoder_input_r = None
+        decoder_output_r = None
+
+    for i, sequence in enumerate(sequences):
+        if reverse:
+            sequence = sequence[::-1]
+
+        decoder_input_seq = start_char + sequence
+        decoder_output_seq = sequence + end_char
+
+        if matching:
+            sequence_r = sequence[::-1]
+            decoder_input_seq_r = start_char + sequence_r
+            decoder_output_seq_r = sequence_r + end_char
+        else:
+            decoder_input_seq_r = None
+            decoder_output_seq_r = None
+
+        for j in range(len(decoder_input_seq)):
+            decoder_input[i, input_char_map[decoder_input_seq[j]], 0, j] = 1
+            decoder_output[i, output_char_map[decoder_output_seq[j]], 0, j] = 1
+            decoder_mask[i, 0, 0, j] = 1
+
+            if matching:
+                decoder_input_r[i, input_char_map[decoder_input_seq_r[j]], 0, j] = 1
+                decoder_output_r[i, output_char_map[decoder_output_seq_r[j]], 0, j] = 1
+
+    return decoder_input, decoder_output, decoder_mask, decoder_input_r, decoder_output_r
+
+
+def sequences_to_encoder_onehot(sequences, char_map, start_char='', end_char=''):
+    num_seqs = len(sequences)
+    max_seq_len = max([len(seq) for seq in sequences]) + len(start_char) + len(end_char)
+    encoder_input = np.zeros((num_seqs, len(char_map), 1, max_seq_len))
+    encoder_mask = np.zeros((num_seqs, 1, 1, max_seq_len))
+
+    for i, sequence in enumerate(sequences):
+        encoder_input_seq = start_char + sequence + end_char
+
+        for j in range(len(encoder_input_seq)):
+            encoder_input[i, char_map[encoder_input_seq[j]], 0, j] = 1
+            encoder_mask[i, 0, 0, j] = 1
+
+    return encoder_input, encoder_mask
+
+
 class SequenceDataset(GeneratorDataset):
     """Abstract sequence dataset"""
-    supported_output_shapes = ['NCHW', 'NHWC', 'NLC']
+    SUPPORTED_OUTPUT_SHAPES = ['NCHW', 'NHWC', 'NLC']
 
     def __init__(
             self,
@@ -109,6 +188,7 @@ class SequenceDataset(GeneratorDataset):
             reverse=False,
             matching=False,
             output_shape='NCHW',
+            output_types='decoder,encoder',
     ):
         super(SequenceDataset, self).__init__(batch_size=batch_size, unlimited_epoch=unlimited_epoch)
 
@@ -116,16 +196,13 @@ class SequenceDataset(GeneratorDataset):
         self.reverse = reverse
         self.matching = matching
         self.output_shape = output_shape
+        self.output_types = output_types
 
-        if output_shape not in self.supported_output_shapes:
+        if output_shape not in self.SUPPORTED_OUTPUT_SHAPES:
             raise KeyError(f'Unsupported output shape: {output_shape}')
 
-        # Make a dictionary that goes from aa to a number for one-hot
-        self.aa_dict = {}
-        self.idx_to_aa = {}
-        for i, aa in enumerate(self.alphabet):
-            self.aa_dict[aa] = i
-            self.idx_to_aa[i] = aa
+        self.aa_dict = self.idx_to_aa = self.output_aa_dict = self.output_idx_to_aa = None
+        self.update_aa_dict()
 
     @property
     def params(self):
@@ -135,20 +212,24 @@ class SequenceDataset(GeneratorDataset):
             "reverse": self.reverse,
             "matching": self.matching,
             "output_shape": self.output_shape,
+            "output_types": self.output_types,
         })
         return params
 
     @params.setter
     def params(self, d):
         GeneratorDataset.params.__set__(self, d)
-        if 'alphabet_type' in d and d['alphabet_type'] != self.alphabet_type:
-            warnings.warn(f"Cannot change alphabet type from {d['alphabet_type']} to {self.alphabet_type}")
+        if 'alphabet_type' in d:
+            self.alphabet_type = d['alphabet_type']
+            self.update_aa_dict()
         if 'reverse' in d:
             self.reverse = d['reverse']
         if 'matching' in d:
             self.matching = d['matching']
         if 'output_shape' in d:
             self.output_shape = d['output_shape']
+        if 'output_types' in d:
+            self.output_types = d['output_types']
 
     @property
     def alphabet(self):
@@ -160,13 +241,14 @@ class SequenceDataset(GeneratorDataset):
             return DNA_ALPHABET
 
     @property
-    def reorder_alphabet(self):
-        if self.alphabet_type == 'protein':
-            return PROTEIN_REORDERED_ALPHABET
-        elif self.alphabet_type == 'RNA':
-            return RNA_ALPHABET
-        elif self.alphabet_type == 'DNA':
-            return DNA_ALPHABET
+    def output_alphabet(self):
+        return self.alphabet
+
+    def update_aa_dict(self):
+        self.aa_dict = {aa: i for i, aa in enumerate(self.alphabet)}
+        self.idx_to_aa = {i: aa for i, aa in enumerate(self.alphabet)}
+        self.output_aa_dict = {aa: i for i, aa in enumerate(self.output_alphabet)}
+        self.output_idx_to_aa = {i: aa for i, aa in enumerate(self.output_alphabet)}
 
     @property
     def n_eff(self):
@@ -185,54 +267,36 @@ class SequenceDataset(GeneratorDataset):
         """
         reverse = self.reverse if reverse is None else reverse
         matching = self.matching if matching is None else matching
-        num_seqs = len(sequences)
-        max_seq_len = max([len(seq) for seq in sequences]) + 1
-        prot_decoder_output = torch.zeros((num_seqs, len(self.alphabet), 1, max_seq_len))
-        prot_decoder_input = torch.zeros((num_seqs, len(self.alphabet), 1, max_seq_len))
+        output = {}
 
-        if matching:
-            prot_decoder_output_r = torch.zeros((num_seqs, len(self.alphabet), 1, max_seq_len))
-            prot_decoder_input_r = torch.zeros((num_seqs, len(self.alphabet), 1, max_seq_len))
-
-        prot_mask_decoder = torch.zeros((num_seqs, 1, 1, max_seq_len))
-
-        for i, sequence in enumerate(sequences):
-            if reverse:
-                sequence = sequence[::-1]
-
-            decoder_input_seq = '*' + sequence
-            decoder_output_seq = sequence + '*'
+        if 'decoder' in self.output_types:
+            decoder_input, decoder_output, decoder_mask, decoder_input_r, decoder_output_r = \
+                sequences_to_decoder_onehot(sequences, self.aa_dict, self.output_aa_dict,
+                                            reverse=reverse, matching=matching)
 
             if matching:
-                sequence_r = sequence[::-1]
-                decoder_input_seq_r = '*' + sequence_r
-                decoder_output_seq_r = sequence_r + '*'
-
-            for j in range(len(decoder_input_seq)):
-                prot_decoder_input[i, self.aa_dict[decoder_input_seq[j]], 0, j] = 1
-                prot_decoder_output[i, self.aa_dict[decoder_output_seq[j]], 0, j] = 1
-                prot_mask_decoder[i, 0, 0, j] = 1
-
-                if matching:
-                    prot_decoder_input_r[i, self.aa_dict[decoder_input_seq_r[j]], 0, j] = 1
-                    prot_decoder_output_r[i, self.aa_dict[decoder_output_seq_r[j]], 0, j] = 1
-
-        if matching:
-            output = {
-                'prot_decoder_input': prot_decoder_input,
-                'prot_decoder_output': prot_decoder_output,
-                'prot_mask_decoder': prot_mask_decoder,
-                'prot_decoder_input_r': prot_decoder_input_r,
-                'prot_decoder_output_r': prot_decoder_output_r
-            }
-        else:
-            output = {
-                'prot_decoder_input': prot_decoder_input,
-                'prot_decoder_output': prot_decoder_output,
-                'prot_mask_decoder': prot_mask_decoder
-            }
+                output.update({
+                    'decoder_input': decoder_input,
+                    'decoder_output': decoder_output,
+                    'decoder_mask': decoder_mask,
+                    'decoder_input_r': decoder_input_r,
+                    'decoder_output_r': decoder_output_r
+                })
+            else:
+                output.update({
+                    'decoder_input': decoder_input,
+                    'decoder_output': decoder_output,
+                    'decoder_mask': decoder_mask
+                })
+        if 'encoder' in self.output_types:
+            encoder_input, encoder_mask = sequences_to_encoder_onehot(sequences, self.aa_dict)
+            output.update({
+                'encoder_input': encoder_input,
+                'encoder_mask': encoder_mask
+            })
 
         for key in output.keys():
+            output[key] = torch.as_tensor(output[key], dtype=torch.float32)
             if self.output_shape == 'NHWC':
                 output[key] = output[key].permute(0, 2, 3, 1).contiguous()
             elif self.output_shape == 'NLC':
@@ -253,6 +317,7 @@ class FastaDataset(SequenceDataset):
             reverse=False,
             matching=False,
             output_shape='NCHW',
+            output_types='decoder',
     ):
         super(FastaDataset, self).__init__(
             batch_size=batch_size,
@@ -261,6 +326,7 @@ class FastaDataset(SequenceDataset):
             reverse=reverse,
             matching=matching,
             output_shape=output_shape,
+            output_types=output_types,
         )
         self.dataset = dataset
         self.working_dir = working_dir
@@ -327,6 +393,7 @@ class SingleFamilyDataset(SequenceDataset):
             reverse=False,
             matching=False,
             output_shape='NCHW',
+            output_types='decoder',
     ):
         super(SingleFamilyDataset, self).__init__(
             batch_size=batch_size,
@@ -335,6 +402,7 @@ class SingleFamilyDataset(SequenceDataset):
             reverse=reverse,
             matching=matching,
             output_shape=output_shape,
+            output_types=output_types,
         )
         self.dataset = dataset
         self.working_dir = working_dir
@@ -447,6 +515,7 @@ class DoubleWeightedNanobodyDataset(SequenceDataset):
             reverse=False,
             matching=False,
             output_shape='NCHW',
+            output_types='decoder',
     ):
         super(DoubleWeightedNanobodyDataset, self).__init__(
             batch_size=batch_size,
@@ -455,6 +524,7 @@ class DoubleWeightedNanobodyDataset(SequenceDataset):
             reverse=reverse,
             matching=matching,
             output_shape=output_shape,
+            output_types=output_types,
         )
         self.dataset = dataset
         self.working_dir = working_dir
@@ -536,9 +606,9 @@ class AntibodySequenceDataset(SequenceDataset):
             reverse=False,
             matching=False,
             output_shape='NLC',
+            output_types='encoder',
             include_vl=False,
             include_vh=False,
-            for_decoder=False,
     ):
         SequenceDataset.__init__(
             self,
@@ -548,12 +618,12 @@ class AntibodySequenceDataset(SequenceDataset):
             reverse=reverse,
             matching=matching,
             output_shape=output_shape,
+            output_types=output_types,
         )
         self.dataset = dataset
         self.working_dir = working_dir
         self.include_vl = include_vl
         self.include_vh = include_vh
-        self.for_decoder = for_decoder
 
         self.vl_list = self.IPI_VL_SEQS.copy()
         self.vh_list = self.IPI_VH_SEQS.copy()
@@ -589,12 +659,13 @@ class AntibodySequenceDataset(SequenceDataset):
             "include_vh": self.include_vh,
             "vl_seqs": self.vl_list,
             "vh_seqs": self.vh_list,
-            "for_decoder": self.for_decoder,
         })
         return params
 
     @params.setter
     def params(self, d):
+        if 'for_decoder' in d:
+            d['output_types'] = 'decoder' if d['for_decoder'] else 'encoder'
         SequenceDataset.params.__set__(self, d)
         if 'include_vl' in d:
             self.include_vl = d['include_vl']
@@ -604,46 +675,47 @@ class AntibodySequenceDataset(SequenceDataset):
             self.vl_list = d['vl_seqs']
         if 'vh_seqs' in d:
             self.vh_list = d['vh_seqs']
-        if 'for_decoder' in d:
-            self.for_decoder = d['for_decoder']
 
     def sequences_to_onehot(self, sequences, vls=None, vhs=None, reverse=None, matching=None):
         num_seqs = len(sequences)
-        max_seq_len = max(len(seq) for seq in sequences)
-        if self.for_decoder:
-            max_seq_len += 1
+        for i in range(num_seqs):
+            if sequences[i][0] == 'C':
+                sequences[i] = sequences[i][1:]
 
-        seq_arr = torch.zeros(num_seqs, max_seq_len, len(self.alphabet))
-        seq_output_arr = torch.zeros(num_seqs, max_seq_len, len(self.alphabet))
-        seq_mask = torch.zeros(num_seqs, max_seq_len, 1)
+        if 'decoder' in self.output_types:
+            seq_arr, seq_output_arr, seq_mask, _, _ = sequences_to_decoder_onehot(
+                sequences, self.aa_dict, self.output_aa_dict, reverse=reverse, matching=False
+            )
+        else:
+            seq_arr, seq_mask = sequences_to_encoder_onehot(sequences, self.aa_dict)
+            seq_output_arr = None
+
+        light_arr = heavy_arr = None
         if self.include_vl:
-            light_arr = torch.zeros(num_seqs, max_seq_len, len(self.light_to_idx))
+            light_arr = np.zeros((num_seqs, len(self.light_to_idx), 1, seq_arr.size(-1)))
         if self.include_vh:
-            heavy_arr = torch.zeros(num_seqs, max_seq_len, len(self.heavy_to_idx))
+            heavy_arr = np.zeros((num_seqs, len(self.heavy_to_idx), 1, seq_arr.size(-1)))
 
-        for i, cdr in enumerate(sequences):
-            if cdr[0] == 'C':
-                cdr = cdr[1:]
-            if self.for_decoder:
-                cdr_out = cdr + '*'
-                cdr = '*' + cdr
-            for j, aa in enumerate(cdr):
-                seq_arr[i, j, self.aa_dict[aa]] = 1.
-                if self.for_decoder:
-                    seq_output_arr[i, j, self.aa_dict[cdr_out[j]]] = 1.
-                seq_mask[i, j, 0] = 1.
-                if self.include_vl:
-                    light_arr[i, j, self.light_to_idx[vls[i]]] = 1.
-                if self.include_vl:
-                    heavy_arr[i, j, self.heavy_to_idx[vhs[i]]] = 1.
+        for i in range(num_seqs):
+            if self.include_vl:
+                light_arr[i, self.light_to_idx[vls[i]], 0, :] = 1.
+            if self.include_vl:
+                heavy_arr[i, self.heavy_to_idx[vhs[i]], 0, :] = 1.
 
         if self.include_vl:
-            seq_arr = torch.cat([seq_arr, light_arr], dim=-1)
+            seq_arr = np.concatenate((seq_arr, light_arr), axis=-1)
         if self.include_vh:
-            seq_arr = torch.cat([seq_arr, heavy_arr], dim=-1)
+            seq_arr = np.concatenate((seq_arr, heavy_arr), axis=-1)
+
         output = {'input': seq_arr, 'mask': seq_mask}
-        if self.for_decoder:
+        if 'decoder' in self.output_types:
             output['decoder_output'] = seq_output_arr
+        for key in output.keys():
+            output[key] = torch.as_tensor(output[key], dtype=torch.float32)
+            if self.output_shape == 'NHWC':
+                output[key] = output[key].permute(0, 2, 3, 1).contiguous()
+            elif self.output_shape == 'NLC':
+                output[key] = output[key].squeeze(2).permute(0, 2, 1).contiguous()
         return output
 
     @property
@@ -654,7 +726,7 @@ class AntibodySequenceDataset(SequenceDataset):
         raise NotImplementedError
 
 
-class IPITrainTestDataset(AntibodySequenceDataset, TrainTestDataset):
+class IPISingleDataset(AntibodySequenceDataset, TrainValTestDataset):
     LABELED = True
 
     def __init__(
@@ -667,12 +739,12 @@ class IPITrainTestDataset(AntibodySequenceDataset, TrainTestDataset):
             reverse=False,
             matching=False,
             output_shape='NLC',
+            output_types='encoder',
             comparisons=(('Aff1', 'PSR1', 0., 0.),),  # before, after, thresh_before, thresh_after
-            train_test_split=1.0,
+            train_val_split=1.0,
             split_seed=42,
             include_vl=False,
             include_vh=False,
-            for_decoder=False,
     ):
         AntibodySequenceDataset.__init__(
             self,
@@ -682,26 +754,25 @@ class IPITrainTestDataset(AntibodySequenceDataset, TrainTestDataset):
             reverse=reverse,
             matching=matching,
             output_shape=output_shape,
+            output_types=output_types,
             include_vl=include_vl,
             include_vh=include_vh,
-            for_decoder=for_decoder,
         )
-        TrainTestDataset.__init__(self)
+        TrainValTestDataset.__init__(self)
         self.dataset = dataset
         self.working_dir = working_dir
         self.comparisons = comparisons
-        self.train_test_split = train_test_split
+        self.train_val_split = train_val_split
         self.split_seed = split_seed
         self.include_vl = include_vl
         self.include_vh = include_vh
-        self.for_decoder = for_decoder
 
         self.cdr_to_output = {}
         self.cdr_to_heavy = {}
         self.cdr_to_light = {}
         self.all_cdr_seqs = []
         self.cdr_seqs_train = []
-        self.cdr_seqs_test = []
+        self.cdr_seqs_val = []
         self.comparison_pos_weights = torch.ones(len(comparisons))
 
         self.load_data()
@@ -737,14 +808,14 @@ class IPITrainTestDataset(AntibodySequenceDataset, TrainTestDataset):
         self.all_cdr_seqs = df[seq_col].values
         print(f'total seqs after intersection: {len(self.all_cdr_seqs)}')
 
-        # split data into train-test
+        # split data into train-val
         with temp_seed(self.split_seed):
             indices = np.random.permutation(len(self.all_cdr_seqs))
-            partition = math.ceil(len(indices) * self.train_test_split)
-            training_idx, test_idx = indices[:partition], indices[partition:]
-            self.cdr_seqs_train, self.cdr_seqs_test = self.all_cdr_seqs[training_idx], self.all_cdr_seqs[test_idx]
-            print(f'train-test split: {self.train_test_split}')
-            print(f'num train, test seqs: {len(self.cdr_seqs_train)}, {len(self.cdr_seqs_test)}')
+            partition = math.ceil(len(indices) * self.train_val_split)
+            training_idx, val_idx = indices[:partition], indices[partition:]
+            self.cdr_seqs_train, self.cdr_seqs_val = self.all_cdr_seqs[training_idx], self.all_cdr_seqs[val_idx]
+            print(f'train-val split: {self.train_val_split}')
+            print(f'num train, val seqs: {len(self.cdr_seqs_train)}, {len(self.cdr_seqs_val)}')
 
         # make table of output values
         self.cdr_to_output = {}
@@ -763,11 +834,33 @@ class IPITrainTestDataset(AntibodySequenceDataset, TrainTestDataset):
         return len(self.cdr_seqs)
 
     @property
+    def params(self):
+        params = super(IPISingleDataset, self).params
+        params.update({
+            "comparisons": self.comparisons,
+            "train_val_split": 1.0,
+            "split_seed": 42,
+        })
+        return params
+
+    @params.setter
+    def params(self, d):
+        AntibodySequenceDataset.params.__set__(self, d)
+        if 'comparisons' in d:
+            self.comparisons = d['comparisons']
+        if 'train_val_split' in d:
+            self.train_val_split = d['train_val_split']
+        if 'split_seed' in d:
+            self.split_seed = d['split_seed']
+
+    @property
     def cdr_seqs(self):
-        if self._training:
+        if self._mode == 'train':
             return self.cdr_seqs_train
+        elif self._mode == 'val':
+            return self.cdr_seqs_val
         else:
-            return self.cdr_seqs_test
+            raise ValueError("No test data available")
 
     def __getitem__(self, index):
         if self.unlimited_epoch:
@@ -792,6 +885,180 @@ class IPITrainTestDataset(AntibodySequenceDataset, TrainTestDataset):
         return batch
 
 
+class IPIMultiDataset(AntibodySequenceDataset, TrainValTestDataset):
+    LABELED = True
+
+    def __init__(
+            self,
+            dataset='',
+            test_datasets=(),
+            working_dir='.',
+            batch_size=32,
+            unlimited_epoch=True,
+            alphabet_type='protein',
+            reverse=False,
+            matching=False,
+            output_shape='NLC',
+            output_types='encoder',
+            comparisons=(('Aff1', 'PSR1', 0., 0.),),  # before, after, thresh_before, thresh_after
+            train_val_split=1.0,
+            split_seed=42,
+            include_vl=False,
+            include_vh=False,
+    ):
+        AntibodySequenceDataset.__init__(
+            self,
+            batch_size=batch_size,
+            unlimited_epoch=unlimited_epoch,
+            alphabet_type=alphabet_type,
+            reverse=reverse,
+            matching=matching,
+            output_shape=output_shape,
+            output_types=output_types,
+            include_vl=include_vl,
+            include_vh=include_vh,
+        )
+        TrainValTestDataset.__init__(self)
+        self.dataset = dataset
+        self.test_datasets = test_datasets
+        self.working_dir = working_dir
+        self.comparisons = comparisons
+        self.train_val_split = train_val_split
+        self.split_seed = split_seed
+        self.include_vl = include_vl
+        self.include_vh = include_vh
+
+        self.cdr_to_output = {}
+        self.cdr_to_heavy = {}
+        self.cdr_to_light = {}
+        self.all_cdr_seqs = []
+        self.cdr_seqs_train = []
+        self.cdr_seqs_val = []
+        self.cdr_seqs_test = []
+        self.comparison_pos_weights = torch.ones(len(comparisons))
+
+        self.load_data()
+
+    def load_data(self):
+        dataset_col = 'dataset'
+        seq_col = 'CDR3'
+        heavy_col = 'heavy'
+        light_col = 'light'
+        count_cols = list({col: None for comparison in self.comparisons for col in comparison[:2]}.keys())
+
+        # load data file
+        filename = os.path.join(self.working_dir, self.dataset)
+        use_cols = [dataset_col, seq_col, heavy_col, light_col] + count_cols
+        df = pd.read_csv(filename, usecols=use_cols)
+        df[count_cols] = df[count_cols].fillna(0.)
+
+        # load output data
+        comparison_cdr_to_output = []
+        for i_comparison, comparison in enumerate(self.comparisons):
+            before, after, before_threshold, after_threshold = comparison
+            comp_df = df.loc[(df[before] > before_threshold) | (df[after] > after_threshold), :]
+
+            comp_out = pd.Series((comp_df[after] > after_threshold).astype(int).values, index=comp_df[seq_col])
+            pos_weight = (len(comp_out) - comp_out.sum()) / comp_out.sum()
+            comparison_cdr_to_output.append(comp_out.to_dict())
+            self.comparison_pos_weights[i_comparison] = pos_weight
+            print(f'comparison: {comparison}, {len(comp_out)} seqs, '
+                  f'{comp_out.mean() * 100:0.1f}% positive, {pos_weight:0.4f} pos_weight')
+
+        # keep only sequences with all output information
+        all_cdrs = set.intersection(*(set(d.keys()) for d in comparison_cdr_to_output))
+        df = df[df[seq_col].isin(all_cdrs)]
+        self.all_cdr_seqs = df[seq_col].values
+        print(f'total seqs after intersection: {len(self.all_cdr_seqs)}')
+
+        self.all_cdr_seqs = df[seq_col].values
+        train_val_cdr_seqs = df.loc[~df[dataset_col].isin(self.test_datasets), seq_col].values
+        print(f'num train+val seqs: {len(train_val_cdr_seqs)}')
+
+        # split data into train-val
+        with temp_seed(self.split_seed):
+            indices = np.random.permutation(len(train_val_cdr_seqs))
+            partition = math.ceil(len(indices) * self.train_val_split)
+            training_idx, val_idx = indices[:partition], indices[partition:]
+            self.cdr_seqs_train, self.cdr_seqs_val = train_val_cdr_seqs[training_idx], train_val_cdr_seqs[val_idx]
+            print(f'train-val split: {self.train_val_split}')
+            print(f'num train, val seqs: {len(self.cdr_seqs_train)}, {len(self.cdr_seqs_val)}')
+
+        self.cdr_seqs_test = df.loc[df[dataset_col].isin(self.test_datasets), seq_col].values
+        print(f'num test seqs: {len(self.cdr_seqs_test)}')
+
+        # make table of output values
+        self.cdr_to_output = {}
+        for cdr in df[seq_col]:
+            output = []
+            for d in comparison_cdr_to_output:
+                output.append(d.get(cdr, 0))
+            self.cdr_to_output[cdr] = output
+
+        df = df.set_index(seq_col)
+        self.cdr_to_heavy = df[heavy_col].to_dict()
+        self.cdr_to_light = df[light_col].to_dict()
+
+    @property
+    def n_eff(self):
+        return len(self.cdr_seqs)
+
+    @property
+    def params(self):
+        params = super(IPIMultiDataset, self).params
+        params.update({
+            "test_datasets": self.test_datasets,
+            "comparisons": self.comparisons,
+            "train_val_split": 1.0,
+            "split_seed": 42,
+        })
+        return params
+
+    @params.setter
+    def params(self, d):
+        AntibodySequenceDataset.params.__set__(self, d)
+        if 'test_datasets' in d:
+            self.test_datasets = d['test_datasets']
+        if 'comparisons' in d:
+            self.comparisons = d['comparisons']
+        if 'train_val_split' in d:
+            self.train_val_split = d['train_val_split']
+        if 'split_seed' in d:
+            self.split_seed = d['split_seed']
+
+    @property
+    def cdr_seqs(self):
+        if self._mode == 'train':
+            return self.cdr_seqs_train
+        elif self._mode == 'val':
+            return self.cdr_seqs_val
+        else:
+            return self.cdr_seqs_test
+
+    def __getitem__(self, index):
+        if self.unlimited_epoch:
+            indices = np.random.randint(0, self.n_eff, self.batch_size)
+        else:
+            first_index = index * self.batch_size
+            last_index = min((index+1) * self.batch_size, self.n_eff)
+            indices = np.arange(first_index, last_index)
+
+        seqs = self.cdr_seqs[indices].tolist()
+        label_arr = torch.zeros(len(indices), len(self.comparisons))
+        for i, seq in enumerate(seqs):
+            for j, output in enumerate(self.cdr_to_output[seq]):
+                label_arr[i, j] = output
+
+        if len(seqs) == 0:
+            return None
+        vls = [self.cdr_to_light[cdr] for cdr in seqs]
+        vhs = [self.cdr_to_heavy[cdr] for cdr in seqs]
+        batch = self.sequences_to_onehot(seqs, vls=vls, vhs=vhs)
+        batch['label'] = label_arr
+        batch['sequences'] = seqs
+        return batch
+
+
 class VHAntibodyDataset(AntibodySequenceDataset):
     """Abstract antibody dataset"""
     IPI_VH_SEQS = ['IGHV1-46', 'IGHV1-69', 'IGHV3-7', 'IGHV3-15', 'IGHV4-39', 'IGHV5-51']  # TODO IGHV1-69D?
@@ -805,9 +1072,9 @@ class VHAntibodyDataset(AntibodySequenceDataset):
             reverse=False,
             matching=False,
             output_shape='NLC',
+            output_types='encoder',
             include_vh=False,
             vh_set_name='IPI',
-            for_decoder=True,
     ):
         super(VHAntibodyDataset, self).__init__(
             batch_size=batch_size,
@@ -816,9 +1083,9 @@ class VHAntibodyDataset(AntibodySequenceDataset):
             reverse=reverse,
             matching=matching,
             output_shape=output_shape,
+            output_types=output_types,
             include_vl=False,
             include_vh=include_vh,
-            for_decoder=for_decoder,
         )
         self.vh_set_name = vh_set_name
 
@@ -884,9 +1151,9 @@ class VHAntibodyFastaDataset(VHAntibodyDataset):
             reverse=False,
             matching=False,
             output_shape='NLC',
+            output_types='decoder',
             include_vh=False,
             vh_set_name='IPI',
-            for_decoder=True,
     ):
         super(VHAntibodyFastaDataset, self).__init__(
             batch_size=batch_size,
@@ -895,9 +1162,9 @@ class VHAntibodyFastaDataset(VHAntibodyDataset):
             reverse=reverse,
             matching=matching,
             output_shape=output_shape,
+            output_types=output_types,
             include_vh=include_vh,
             vh_set_name=vh_set_name,
-            for_decoder=for_decoder,
         )
         self.dataset = dataset
         self.working_dir = working_dir
@@ -975,9 +1242,9 @@ class VHClusteredAntibodyDataset(VHAntibodyDataset):
             reverse=False,
             matching=False,
             output_shape='NLC',
+            output_types='decoder',
             include_vh=False,
             vh_set_name='IPI',
-            for_decoder=True,
     ):
         super(VHClusteredAntibodyDataset, self).__init__(
             batch_size=batch_size,
@@ -986,9 +1253,9 @@ class VHClusteredAntibodyDataset(VHAntibodyDataset):
             reverse=reverse,
             matching=matching,
             output_shape=output_shape,
+            output_types=output_types,
             include_vh=include_vh,
             vh_set_name=vh_set_name,
-            for_decoder=for_decoder,
         )
         self.dataset = dataset
         self.working_dir = working_dir
@@ -1055,4 +1322,3 @@ class VHClusteredAntibodyDataset(VHAntibodyDataset):
 
         batch = self.sequences_to_onehot(seqs, vhs=vhs)
         return batch
-

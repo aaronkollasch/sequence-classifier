@@ -186,4 +186,3 @@ class BayesianGRU(nn.GRU):
     @property
     def all_weights(self):  # included with _flat_weights for interpretability, but may not be necessary
         return [[getattr(self, weight) for weight in weights] for weights in self._all_weights]
-

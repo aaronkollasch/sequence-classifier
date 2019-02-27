@@ -13,8 +13,8 @@ import trainers
 import model_logging
 from utils import get_cuda_version, get_cudnn_version
 
-# working_dir = '/n/groups/marks/users/aaron/autoregressive'
-# data_dir = '/n/groups/marks/projects/autoregressive'
+# working_dir = '/n/groups/marks/projects/antibodies/classifier'
+# data_dir = '/n/groups/marks/projects/antibodies/classifier'
 working_dir = '.'
 data_dir = '.'
 
@@ -74,7 +74,8 @@ pwd
 module load gcc/6.2.0 cuda/9.0
 srun stdbuf -oL -eL {sys.executable} \\
   {sys.argv[0]} \\
-  {restore_args}
+  {restore_args} \\
+  --restore {{restore}}
 """
 
 torch.manual_seed(args.r_seed)
@@ -114,7 +115,8 @@ def get_dataset(step=0):
             matching=True,
             unlimited_epoch=True,
             include_vh=args.include_vh,
-            for_decoder=True
+            output_shape='NLC',
+            output_types='decoder',
         )
         _loader = data_loaders.GeneratorDataLoader(
             _dataset,
@@ -124,17 +126,18 @@ def get_dataset(step=0):
         )
         return _dataset, _loader
     else:
-        _dataset = data_loaders.IPITrainTestDataset(
+        _dataset = data_loaders.IPISingleDataset(
             batch_size=args.batch_size,
             working_dir=working_dir,
             dataset=args.labeled_dataset,
-            train_test_split=0.9,
+            train_val_split=0.9,
             comparisons=(('Aff1', 'PSR1', 2., 2.),),
             matching=True,
             unlimited_epoch=True,
             include_vl=False,
             include_vh=args.include_vh,
-            for_decoder=True
+            output_shape='NLC',
+            output_types='decoder',
         )
         _loader = data_loaders.GeneratorDataLoader(
             _dataset,
@@ -211,8 +214,8 @@ if model.step < args.num_iterations:
     del trainer.loader
     dataset, loader = get_dataset(model.step)
     trainer.loader = loader
+    # print("Dataset parameters:", json.dumps(dataset.params, indent=4))
 
 trainer.params['snapshot_interval'] = args.num_labeled_iterations // 1
 model.enable_gradient = 'edb'
-# print("Dataset parameters:", json.dumps(dataset.params, indent=4))
 trainer.train(steps=args.num_iterations + args.num_labeled_iterations)

@@ -9,20 +9,21 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data
 
-from data_loaders import GeneratorDataLoader, IPITrainTestDataset
+from data_loaders import GeneratorDataLoader, IPISingleDataset, IPIMultiDataset, TrainValTestDataset
 from model_logging import Logger
+from utils import enter_local_rng_state, exit_local_rng_state
 
 
 class ClassifierTrainer:
     default_params = {
-            'optimizer': 'Adam',
-            'lr': 0.001,
-            'weight_decay': 0,
-            'clip': 10.0,
-            'snapshot_path': None,
-            'snapshot_name': 'snapshot',
-            'snapshot_interval': 1000,
-        }
+        'optimizer': 'Adam',
+        'lr': 0.001,
+        'weight_decay': 0,
+        'clip': 10.0,
+        'snapshot_path': None,
+        'snapshot_name': 'snapshot',
+        'snapshot_interval': 1000,
+    }
 
     def __init__(
             self,
@@ -80,11 +81,18 @@ class ClassifierTrainer:
         self.model.train()
 
         losses, accuracies, true_outputs, logits, rocs = self.validate()
-        print(f"validation losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}", flush=True)
-        print(f"validation accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}", flush=True)
-        print(f"validation true values: {', '.join(['{:6.4f}'.format(val) for val in true_outputs])}", flush=True)
-        print(f"validation average logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}", flush=True)
-        print(f"validation AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}", flush=True)
+        print(f"val  losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}, "
+              f"accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}, "
+              f"logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}, "
+              f"AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}",
+              flush=True)
+
+        losses, accuracies, true_outputs, logits, rocs = self.test(num_samples=1)
+        print(f"test losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}, "
+              f"accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}, "
+              f"logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}, "
+              f"AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}",
+              flush=True)
 
         pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
         data_iter = iter(self.loader)
@@ -97,7 +105,8 @@ class ClassifierTrainer:
 
             batch = next(data_iter)
             for key in batch.keys():
-                batch[key] = batch[key].to(self.device, non_blocking=True)
+                if isinstance(batch[key], torch.Tensor):
+                    batch[key] = batch[key].to(self.device, non_blocking=True)
             # data_load_time = time.time()-start
 
             output_logits = self.model(batch['input'], batch['mask'])
@@ -127,10 +136,14 @@ class ClassifierTrainer:
             # print("{: 8d} {:6.3f} {:5.4f} {:11.6f} {:11.6f}".format(
             #     step, time.time()-start, data_load_time, loss.detach(), accuracy.detach()), flush=True)
 
-    def validate(self):
+    def validate(self, r_seed=42):
+        if len(self.loader.dataset.cdr_seqs_val) == 0:
+            return None
+
         self.model.eval()
-        self.loader.dataset.test()
+        self.loader.dataset.val()
         self.loader.dataset.unlimited_epoch = False
+        prev_state = enter_local_rng_state(r_seed)
 
         with torch.no_grad():
             loader = GeneratorDataLoader(self.loader.dataset, num_workers=self.loader.num_workers)
@@ -143,7 +156,8 @@ class ClassifierTrainer:
             accuracies = []
             for batch in loader:
                 for key in batch.keys():
-                    batch[key] = batch[key].to(self.device, non_blocking=True)
+                    if isinstance(batch[key], torch.Tensor):
+                        batch[key] = batch[key].to(self.device, non_blocking=True)
                 output_logits = self.model(batch['input'], batch['mask'])
 
                 loss_dict = self.model.calculate_loss(
@@ -172,49 +186,71 @@ class ClassifierTrainer:
         self.model.train()
         self.loader.dataset.train()
         self.loader.dataset.unlimited_epoch = True
+        exit_local_rng_state(prev_state)
         return losses, accuracies, true_outputs, logits, roc_scores
 
-    def test(self, data_loader, model_eval=True, num_samples=1):  # TODO implement
+    def test(self, model_eval=True, num_samples=1, r_seed=42):
         if model_eval:
             self.model.eval()
+        if isinstance(self.loader.dataset, TrainValTestDataset):
+            self.loader.dataset.test()
+        self.loader.dataset.unlimited_epoch = False
+        prev_state = enter_local_rng_state(r_seed)
 
-        print('    step  step-t  CE-loss     bit-per-char', flush=True)
-        for i_iter in range(num_samples):  # TODO implement sampling
-            output = {
-                'name': [],
-                'mean': [],
-                'bitperchar': [],
-                'sequence': []
-            }
+        loader = GeneratorDataLoader(self.loader.dataset, num_workers=self.loader.num_workers)
+        pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
+        n_eff = len(self.loader.dataset.cdr_seqs_train)
 
-            for i_batch, batch in enumerate(data_loader):
-                start = time.time()
+        true_outputs = []
+        sequences = []
+        logits = []
+        for i_iter in range(num_samples):
+            true_outputs = []
+            logits_i = []
+            sequences = []
+
+            for i_batch, batch in enumerate(loader):
                 for key in batch.keys():
                     if isinstance(batch[key], torch.Tensor):
                         batch[key] = batch[key].to(self.device, non_blocking=True)
 
                 with torch.no_grad():
                     output_logits = self.model(batch['input'], batch['mask'])
-                    pred = self.model.predict(output_logits)
 
-                    ce_loss = losses['ce_loss_per_seq']
-                    if self.run_fr:
-                        ce_loss_mean = ce_loss.mean(0)
-                    else:
-                        ce_loss_mean = ce_loss
-                    ce_loss_per_char = ce_loss_mean / batch['prot_mask_decoder'].sum([1, 2, 3])
+                true_outputs.append(batch['label'])
+                sequences.extend(batch['sequences'])
+                logits_i.append(output_logits)
 
-                output['name'].extend(batch['names'])
-                output['sequence'].extend(batch['sequences'])
-                output['mean'].extend(ce_loss_mean.numpy())
-                output['bitperchar'].extend(ce_loss_per_char.numpy())
+            true_outputs = torch.cat(true_outputs, 0)
+            logits.append(torch.cat(logits_i, 0))
 
-                print("{: 8d} {:6.3f} {:11.6f} {:11.6f}".format(
-                    i_batch, time.time()-start, ce_loss_mean.mean(), ce_loss_per_char.mean()),
-                    flush=True)
+        logits = torch.stack(logits, 0).mean(0)
+
+        loss_dict = self.model.calculate_loss(
+            logits, true_outputs, n_eff=n_eff, pos_weight=pos_weights, reduction='none')
+        error = self.model.calculate_accuracy(
+            logits, true_outputs, reduction='none')
+
+        true_outputs = true_outputs.cpu().numpy()
+        logits = logits.cpu().numpy()
+        roc_scores = roc_auc_score(true_outputs, logits, average=None)
+        if isinstance(roc_scores, np.ndarray):
+            roc_scores = roc_scores.tolist()
+        else:
+            roc_scores = [roc_scores]
+
+        # TODO return output per test sequence as well
+        true_outputs = true_outputs.mean(0).tolist()
+        logits = logits.mean(0).tolist()
+        losses = loss_dict['ce_loss'].mean(0).cpu().tolist()
+        accuracies = error.mean(0).cpu().tolist()
 
         self.model.train()
-        return output
+        if isinstance(self.loader.dataset, TrainValTestDataset):
+            self.loader.dataset.train()
+        self.loader.dataset.unlimited_epoch = True
+        exit_local_rng_state(prev_state)
+        return losses, accuracies, true_outputs, logits, roc_scores
 
     def save_state(self, last_batch=None):
         snapshot = f"{self.params['snapshot_path']}/{self.params['snapshot_name']}_{self.model.step}.pth"
@@ -260,14 +296,14 @@ class ClassifierTrainer:
 
 class GenerativeClassifierTrainer:
     default_params = {
-            'optimizer': 'Adam',
-            'lr': 0.001,
-            'weight_decay': 0,
-            'clip': 10.0,
-            'snapshot_path': None,
-            'snapshot_name': 'snapshot',
-            'snapshot_interval': 1000,
-        }
+        'optimizer': 'Adam',
+        'lr': 0.001,
+        'weight_decay': 0,
+        'clip': 10.0,
+        'snapshot_path': None,
+        'snapshot_name': 'snapshot',
+        'snapshot_interval': 1000,
+    }
 
     def __init__(
             self,
@@ -374,10 +410,12 @@ class GenerativeClassifierTrainer:
             #     loss.detach(), ce_loss.detach(), bitperchar.detach()), flush=True)
 
     def validate(self):
-        if not isinstance(self.loader.dataset, IPITrainTestDataset):
+        if isinstance(self.loader.dataset, IPISingleDataset) or isinstance(self.loader.dataset, IPIMultiDataset):
+            pass
+        else:
             return None
         self.model.eval()
-        self.loader.dataset.test()
+        self.loader.dataset.val()
         self.loader.dataset.unlimited_epoch = False
 
         with torch.no_grad():
@@ -451,7 +489,7 @@ class GenerativeClassifierTrainer:
                         ce_loss_mean = ce_loss.mean(0)
                     else:
                         ce_loss_mean = ce_loss
-                    ce_loss_per_char = ce_loss_mean / batch['prot_mask_decoder'].sum([1, 2, 3])
+                    ce_loss_per_char = ce_loss_mean / batch['prot_decoder_mask'].sum([1, 2, 3])
 
                 output['name'].extend(batch['names'])
                 output['sequence'].extend(batch['sequences'])

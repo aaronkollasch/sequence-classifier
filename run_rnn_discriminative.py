@@ -3,6 +3,8 @@ import sys
 import argparse
 import time
 import json
+import hashlib
+import warnings
 
 import numpy as np
 import torch
@@ -13,20 +15,28 @@ import trainers
 import model_logging
 from utils import get_cuda_version, get_cudnn_version
 
-working_dir = '/n/groups/marks/users/aaron/autoregressive'
-data_dir = '/n/groups/marks/projects/autoregressive'
+working_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
+data_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
 
 parser = argparse.ArgumentParser(description="Train an autoregressive model on a collection of sequences.")
 parser.add_argument("--hidden-size", type=int, default=None,
                     help="Number of channels in the RNN hidden state.")
 parser.add_argument("--num-layers", type=int, default=None,
                     help="Number of RNN layers.")
+parser.add_argument("--hidden-size-dense", type=int, default=None,
+                    help="Number of channels in the dense hidden state.")
+parser.add_argument("--num-layers-dense", type=int, default=None,
+                    help="Number of dense layers.")
 parser.add_argument("--num-iterations", type=int, default=250005,
                     help="Number of iterations to run the model.")
 parser.add_argument("--batch-size", type=int, default=32,
                     help="Batch size.")
 parser.add_argument("--dataset", type=str, default=None,
-                    help="Dataset name for fitting model. Alignment weights must be computed beforehand.")
+                    help="Dataset name for fitting model.")
+parser.add_argument("--test-datasets", type=str, default=[], nargs='*',
+                    help="Datasets names in \"dataset\" column to use for testing.")
+parser.add_argument("--train-val-split", type=float, default=0.9,
+                    help="Proportion of training data to use for training.")
 parser.add_argument("--include-vl", action='store_true',
                     help="Include an encoding of the VL gene in the input.")
 parser.add_argument("--include-vh", action='store_true',
@@ -47,9 +57,15 @@ parser.add_argument("--no-cuda", action='store_true',
                     help="Disable GPU training")
 args = parser.parse_args()
 
+if len(args.test_datasets) == 0:
+    warnings.warn('No test datasets specified.')
+
 if args.run_name is None:
-    args.run_name = f"{args.dataset}_elu_channels-{args.channels}_dropout-{args.dropout_p}_rseed-{args.r_seed}" \
-        f"_start-{time.strftime('%y%b%d_%H%M', time.localtime())}"
+    args.run_name = f"{args.dataset.split('/')[-1]}" \
+        f"_n-r-{args.num_layers}-d-{args.num_layers_dense}" \
+        f"_h-r-{args.hidden_size}-d-{args.hidden_size_dense}" \
+        f"_drop-r-{args.dropout_p_rnn}-d-{args.dropout_p_dense}" \
+        f"_rseed-{args.r_seed}_start-{time.strftime('%y%b%d_%H%M', time.localtime())}"
 
 restore_args = " \\\n  ".join(sys.argv[1:])
 if "--run-name" not in restore_args:
@@ -69,9 +85,17 @@ pwd
 module load gcc/6.2.0 cuda/9.0
 srun stdbuf -oL -eL {sys.executable} \\
   {sys.argv[0]} \\
-  {restore_args}
+  {restore_args} \\
+  --restore {{restore}}
 """
 
+if args.restore is not None:
+    # prevent from repeating batches/seed when restoring at intermediate point
+    # script is repeatable as long as restored at same point with same restore string
+    args.r_seed += int(hashlib.sha1(args.restore.encode()).hexdigest(), 16)
+    args.r_seed = args.r_seed % (2 ** 32 - 1)  # limit of np.random.seed
+
+np.random.seed(args.r_seed)
 torch.manual_seed(args.r_seed)
 torch.cuda.manual_seed_all(args.r_seed)
 
@@ -99,15 +123,20 @@ print()
 
 print("Run:", args.run_name)
 
-dataset = data_loaders.IPITrainTestDataset(
+print("Loading data.")
+dataset = data_loaders.IPIMultiDataset(
     batch_size=args.batch_size,
     working_dir=data_dir,
     dataset=args.dataset,
+    test_datasets=args.test_datasets,
+    train_val_split=args.train_val_split,
     matching=True,
     unlimited_epoch=True,
     include_vl=args.include_vl,
     include_vh=args.include_vh,
-    for_decoder=False,
+    comparisons=(('Aff1', 'PSR1', 2., 2.),),
+    output_shape='NLC',
+    output_types='encoder',
 )
 loader = data_loaders.GeneratorDataLoader(
     dataset,
@@ -136,6 +165,8 @@ else:
             ('rnn', 'hidden_size', args.hidden_size),
             ('rnn', 'num_layers', args.num_layers),
             ('rnn', 'dropout_p', args.dropout_p_rnn),
+            ('dense', 'hidden_size', args.hidden_size_dense),
+            ('dense', 'num_layers', args.num_layers_dense),
             ('dense', 'dropout_p', args.dropout_p_dense),
     ):
         if param is not None:
@@ -152,21 +183,28 @@ trainer = trainers.ClassifierTrainer(
     snapshot_interval=args.num_iterations // 10,
     snapshot_exec_template=sbatch_executable,
     device=device,
-    logger=model_logging.Logger(),
-    # logger=model_logging.TensorboardLogger(
-    #     log_interval=500,
-    #     validation_interval=1000,
-    #     generate_interval=5000,
-    #     log_dir=working_dir + '/logs/' + args.run_name
-    # )
+    # logger=model_logging.Logger(),
+    logger=model_logging.TensorboardLogger(
+        log_interval=500,
+        validation_interval=5000,
+        generate_interval=5000,
+        test_interval=5000,
+        log_dir=working_dir + '/logs/' + args.run_name,
+        print_output=True
+    )
 )
 if args.restore is not None:
     trainer.load_state(checkpoint)
 
+print()
+print("Model:", model.__class__.__name__)
 print("Hyperparameters:", json.dumps(model.hyperparams, indent=4))
+print("Trainer:", trainer.__class__.__name__)
 print("Training parameters:", json.dumps(
     {key: value for key, value in trainer.params.items() if key != 'snapshot_exec_template'}, indent=4))
+print("Dataset:", dataset.__class__.__name__)
 print("Dataset parameters:", json.dumps(dataset.params, indent=4))
 print("Num trainable parameters:", model.parameter_count())
+print(f"Training for {args.num_iterations - model.step} iterations.")
 
 trainer.train(steps=args.num_iterations)

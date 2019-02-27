@@ -95,18 +95,20 @@ class DiscriminativeRNN(RNN):
         }
 
     def __init__(self, dims=None, hyperparams=None):
-        super(DiscriminativeRNN, self).__init__(dims=dims, hyperparams=hyperparams)
+        RNN.__init__(self, dims=dims, hyperparams=hyperparams)
 
         if self.hyperparams['regularization']['bayesian']:
             self.hyperparams['regularization']['l2'] = False
         elif self.hyperparams['regularization']['l2']:
             # torch built-in weight decay is more efficient than manual calculation
             self.hyperparams['optimization']['weight_decay'] = self.hyperparams['regularization']['l2_lambda']
+
         if self.hyperparams['regularization']['prior_params'] is None:
             if self.hyperparams['regularization']['prior_type'] == 'gaussian':
                 self.hyperparams['regularization']['prior_params'] = (0., 1.)
             elif self.hyperparams['regularization']['prior_type'] == 'scale_mix_gaussian':
                 self.hyperparams['regularization']['prior_params'] = (0.1, 0., 1., 0., 0.001)
+
         if self.hyperparams['regularization']['bayesian'] and (
             self.hyperparams['rnn']['dropout_p'] > 0 or
             self.hyperparams['dense']['dropout_p'] > 0
@@ -292,18 +294,20 @@ class GenerativeRNN(RNN):
     }
 
     def __init__(self, dims=None, hyperparams=None):
-        super(GenerativeRNN, self).__init__(dims=dims, hyperparams=hyperparams)
+        RNN.__init__(self, dims=dims, hyperparams=hyperparams)
 
         if self.hyperparams['regularization']['bayesian']:
             self.hyperparams['regularization']['l2'] = False
         elif self.hyperparams['regularization']['l2']:
             # torch built-in weight decay is more efficient than manual calculation
             self.hyperparams['optimization']['weight_decay'] = self.hyperparams['regularization']['l2_lambda']
+
         if self.hyperparams['regularization']['prior_params'] is None:
             if self.hyperparams['regularization']['prior_type'] == 'gaussian':
                 self.hyperparams['regularization']['prior_params'] = (0., 1.)
             elif self.hyperparams['regularization']['prior_type'] == 'scale_mix_gaussian':
                 self.hyperparams['regularization']['prior_params'] = (0.1, 0., 1., 0., 0.001)
+
         if self.hyperparams['regularization']['bayesian'] and (
             self.hyperparams['rnn']['dropout_p'] > 0 or
             self.hyperparams['dense']['dropout_p'] > 0
@@ -547,7 +551,7 @@ class GenerativeRNN(RNN):
         return output
 
     def predict_all_y(self, inputs, input_masks, outputs):
-        """Get p(x|y)p(y) for all possible y
+        """Get p(x|y)p(y) for all possible choices of y
 
         :return: (n_batch, n_choices), (n_choices, n_features)
         """
@@ -572,11 +576,11 @@ class GenerativeRNN(RNN):
         p_labels = torch.stack([1-p_labels, p_labels]).transpose(0, 1)
 
         # p_y_choices: (n_choices)
-        p_y_choices = (torch.eye(2, device=inputs.device)[y_choices.long()] * p_labels.unsqueeze(0))
-        p_y_choices = p_y_choices.sum(2).clamp_min(1e-6).log().sum(1)
+        p_y_choices = (torch.eye(2, device=inputs.device)[y_choices.long()] * p_labels.unsqueeze(0)).sum(2)
+        p_y_choices = p_y_choices.clamp_min(1e-6).log().sum(1)
 
         log_probs = []
-        for y, p_y in zip(y_choices, p_y_choices):
+        for y, log_p_y in zip(y_choices, p_y_choices):
             label_embedding = self.label_embedding(y)
             hiddens = torch.cat([
                 out_states,
@@ -585,7 +589,7 @@ class GenerativeRNN(RNN):
             output_logits = self.dense_net(hiddens)
 
             # calculate p(x|y)p(y)
-            log_probs.append((output_logits.log_softmax(2) * outputs).sum([1, 2]) + p_y)
+            log_probs.append((output_logits.log_softmax(2) * outputs).sum([1, 2]) + log_p_y)
 
         log_probs = torch.stack(log_probs, 1)
         return log_probs, y_choices

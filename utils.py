@@ -43,6 +43,23 @@ def temp_seed(seed):
         np.random.set_state(state)
 
 
+def enter_local_rng_state(seed):
+    prev_state = [np.random.get_state(), torch.get_rng_state()]
+    if torch.cuda.is_available():
+        prev_state.append(torch.cuda.get_rng_state())
+        torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    return prev_state
+
+
+def exit_local_rng_state(prev_state):
+    np.random.set_state(prev_state[0])
+    torch.set_rng_state(prev_state[1])
+    if torch.cuda.is_available():
+        torch.cuda.set_rng_state(prev_state[2])
+
+
 # https://github.com/ilkarman/DeepLearningFrameworks/blob/master/notebooks/common/utils.py
 def get_gpu_name():
     try:

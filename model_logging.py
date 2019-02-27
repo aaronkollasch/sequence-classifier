@@ -14,12 +14,14 @@ class Logger:
                  log_interval=50,
                  validation_interval=200,
                  generate_interval=500,
+                 test_interval=None,
                  trainer=None,
                  generate_function=None):
         self.trainer = trainer
         self.log_interval = log_interval
         self.val_interval = validation_interval
         self.gen_interval = generate_interval
+        self.test_interval = test_interval
         self.log_time = time.time()
         self.accumulated_loss = 0
         self.accumulated_accuracy = 0
@@ -45,6 +47,8 @@ class Logger:
             self.validate(current_step)
         if self.gen_interval is not None and self.gen_interval > 0 and current_step % self.gen_interval == 0:
             self.generate(current_step)
+        if self.test_interval is not None and self.test_interval > 0 and current_step % self.test_interval == 0:
+            self.test(current_step)
 
     def log_loss(self, current_step):
         avg_loss = self.accumulated_loss / self.log_interval
@@ -58,11 +62,11 @@ class Logger:
         if validation is None:
             return
         losses, accuracies, true_outputs, logits, rocs = validation
-        print(f"validation losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}", flush=True)
-        print(f"validation accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}", flush=True)
-        # print(f"validation true values: {', '.join(['{:6.4f}'.format(val) for val in true_outputs])}", flush=True)
-        print(f"validation average logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}", flush=True)
-        print(f"validation AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}", flush=True)
+        print(f"val  losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}, "
+              f"accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}, "
+              f"logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}, "
+              f"AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}",
+              flush=True)
 
     def generate(self, current_step):
         if self.generate_function is None:
@@ -74,6 +78,17 @@ class Logger:
             self.generate_thread = threading.Thread(target=self.generate_function, args=[current_step])
             self.generate_thread.daemon = True
             self.generate_thread.start()
+    
+    def test(self, current_step):
+        test = self.trainer.test(num_samples=1)
+        if test is None:
+            return
+        losses, accuracies, true_outputs, logits, rocs = test
+        print(f"test losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}, "
+              f"accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}, "
+              f"logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}, "
+              f"AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}",
+              flush=True)
 
 
 # Code referenced from https://gist.github.com/gyglim/1f8dfb1b5c82627ae3efcfbbadb9f514
@@ -82,14 +97,20 @@ class TensorboardLogger(Logger):
                  log_interval=50,
                  validation_interval=200,
                  generate_interval=500,
+                 test_interval=None,
                  trainer=None,
                  generate_function=None,
                  log_dir='logs',
                  log_param_histograms=False,
+                 log_image_summaries=True,
+                 print_output=False,
                  ):
-        super().__init__(log_interval, validation_interval, generate_interval, trainer, generate_function)
+        super().__init__(log_interval, validation_interval, generate_interval, test_interval,
+                         trainer, generate_function)
         self.writer = tf.summary.FileWriter(log_dir)
         self.log_param_histograms = log_param_histograms
+        self.log_image_summaries = log_image_summaries
+        self.print_output = print_output
 
     def log(self, current_step, current_losses, current_grad_norm):
         super(TensorboardLogger, self).log(current_step, current_losses, current_grad_norm)
@@ -101,6 +122,8 @@ class TensorboardLogger(Logger):
             self.scalar_summary('bitperchar', current_losses['bitperchar'].detach(), current_step)
 
     def log_loss(self, current_step):
+        if self.print_output:
+            Logger.log_loss(self, current_step)
         # loss
         avg_loss = self.accumulated_loss / self.log_interval
         self.scalar_summary('avg loss', avg_loss, current_step)
@@ -112,17 +135,39 @@ class TensorboardLogger(Logger):
                 if value.grad is not None:
                     self.histo_summary(tag + '/grad', value.grad.data, current_step)
 
-        for tag, summary in self.trainer.model.image_summaries.items():
-            self.image_summary(tag, summary['img'], current_step, max_outputs=summary.get('max_outputs', 3))
+        if self.log_image_summaries:
+            for tag, summary in self.trainer.model.image_summaries.items():
+                self.image_summary(tag, summary['img'], current_step, max_outputs=summary.get('max_outputs', 3))
 
     def validate(self, current_step):
         validation = self.trainer.validate()
         if validation is None:
             return
         losses, accuracies, true_outputs, logits, rocs = validation
-        for i, loss, acc in enumerate(zip(losses, accuracies)):
+        for i, (loss, acc) in enumerate(zip(losses, accuracies)):
             self.scalar_summary(f'validation loss {i}', loss, current_step)
             self.scalar_summary(f'validation accuracy {i}', acc, current_step)
+        if self.print_output:
+            print(f"val  losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}, "
+                  f"accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}, "
+                  f"logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}, "
+                  f"AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}",
+                  flush=True)
+    
+    def test(self, current_step):
+        test = self.trainer.test(num_samples=1)
+        if test is None:
+            return
+        losses, accuracies, true_outputs, logits, rocs = test
+        for i, (loss, acc) in enumerate(zip(losses, accuracies)):
+            self.scalar_summary(f'test loss {i}', loss, current_step)
+            self.scalar_summary(f'test accuracy {i}', acc, current_step)
+        if self.print_output:
+            print(f"test losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}, "
+                  f"accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}, "
+                  f"logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}, "
+                  f"AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}",
+                  flush=True)
 
     def scalar_summary(self, tag, value, step):
         """Log a scalar variable."""
