@@ -13,7 +13,7 @@ class HyperparameterError(ValueError):
 
 class GaussianWeightUncertainty(object):
     """Implementation of weight uncertainty
-    From https://arxiv.org/abs/1505.05424
+    Paper: https://arxiv.org/abs/1505.05424
     See also https://www.nitarshan.com/bayes-by-backprop/"""
     def __init__(self, name, hyperparams):
         self.name = name

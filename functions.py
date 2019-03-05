@@ -12,7 +12,7 @@ def gelu(x):
         For information: OpenAI GPT's gelu is slightly different (and gives slightly different results):
         0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
     """
-    return x * 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
+    return x * 0.5 * (1.0 + (x / math.sqrt(2.0)).erf())
 
 
 def swish(x):
@@ -59,7 +59,7 @@ def comb_losses(losses_f, losses_r):
     losses_comb = {}
     for key in losses_f.keys():
         if 'per_seq' in key:
-            losses_comb[key] = torch.stack([losses_f[key], losses_r[key]])
+            losses_comb[key] = torch.stack((losses_f[key], losses_r[key]))
         else:
             losses_comb[key] = losses_f[key] + losses_r[key]
             losses_comb[key + '_f'] = losses_f[key]
@@ -185,11 +185,11 @@ def kl_mixture_gaussians(
     prob_one = dist.Normal(mu_one, sigma_one).log_prob(mu) + math.log(clamp(p, 1e-10, 1))
     prob_two = dist.Normal(mu_two, sigma_two).log_prob(mu) + math.log(clamp(1 - p, 1e-10, 1))
     entropy = 0.5 * math.log(2.0 * math.pi * math.e) + sigma.log()
-    return torch.logsumexp(torch.stack([prob_one, prob_two]), dim=0) + entropy
+    return torch.logsumexp(torch.stack((prob_one, prob_two)), dim=0).add(entropy)
 
 
 def mle_mixture_gaussians(w, p=0.1, mu_one=0., sigma_one=1., mu_two=0., sigma_two=0.01):
     """Log probability of w with a scale mixture of gaussians prior"""
     prob_one = dist.Normal(mu_one, sigma_one).log_prob(w) + math.log(clamp(p, 1e-10, 1))
     prob_two = dist.Normal(mu_two, sigma_two).log_prob(w) + math.log(clamp(1-p, 1e-10, 1))
-    return torch.logsumexp(torch.stack([prob_one, prob_two]), dim=0)
+    return torch.logsumexp(torch.stack((prob_one, prob_two)), dim=0)

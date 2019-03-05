@@ -3,13 +3,12 @@ from typing import Union, Dict, Sequence
 import warnings
 from copy import deepcopy
 import itertools
-import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from functions import Nonlinearity, l2_normalize, clamp
+from functions import Nonlinearity, l2_normalize
 from utils import recursive_update
 import layers
 
@@ -223,7 +222,7 @@ class DiscriminativeRNN(RNN):
 
         # regularization
         if reg_params['bayesian']:
-            loss += self.weight_cost() * reg_params['bayesian_lambda'] / n_eff
+            loss += self.weight_cost().mul(reg_params['bayesian_lambda'] / n_eff)
         elif reg_params['l2']:
             # # Skip; using built-in optimizer weight_decay instead
             # loss += self.weight_cost() * reg_params['l2_lambda'] / n_eff
@@ -263,7 +262,7 @@ class GenerativeRNN(RNN):
             'hidden_size': 20,
         },
         'dense': {
-            'num_layers': 1,
+            'num_layers': 2,
             'ordering': ['nonlin', 'norm', 'dropout', 'linear'],
             'hidden_size': 50,
             'nonlinearity': 'relu',
@@ -427,9 +426,9 @@ class GenerativeRNN(RNN):
         :return: tensor(n_labels)
         """
         if self._label_count == 0:
-            return None
+            return self._count_labels.add(0.5)
         else:
-            return self._count_labels / self._label_count
+            return self._count_labels.div(self._label_count)
 
     def weight_costs(self):
         return (
@@ -466,10 +465,10 @@ class GenerativeRNN(RNN):
             label_embedding = self.label_embedding(labels)
 
         # hiddens: (batch, seq_len, num_directions * hidden_size + emb_size)
-        hiddens = torch.cat([
+        hiddens = torch.cat((
             out_states,
             label_embedding.unsqueeze(1).expand(-1, out_states.size(1), -1)
-        ], -1)
+        ), -1)
 
         # (batch, seq_len, alphabet_size)
         output_logits = self.dense_net(hiddens)
@@ -513,7 +512,7 @@ class GenerativeRNN(RNN):
             seq_logits, target_seqs, mask
         )
         if labels is not None:
-            self._count_labels += labels.detach().sum(0)
+            self._count_labels += labels.detach().sum(0).cpu()
             self._label_count += labels.size(0)
             if pos_weight is not None:
                 weights_per_seq = (labels * pos_weight.unsqueeze(0) + (1-labels)).prod(1)
@@ -525,7 +524,7 @@ class GenerativeRNN(RNN):
 
         # regularization
         if reg_params['bayesian']:
-            loss += self.weight_cost() * reg_params['bayesian_lambda'] / n_eff
+            loss += self.weight_cost().mul(reg_params['bayesian_lambda'] / n_eff)
         elif reg_params['l2']:
             # # Skip; use built-in optimizer weight_decay instead
             # loss += self.weight_cost() * reg_params['l2_lambda'] / n_eff
@@ -566,26 +565,23 @@ class GenerativeRNN(RNN):
         out_states, self.hidden = self.rnn(x, self.hidden, step=self.step)
 
         # y_choices: (n_choices, n_features)
-        y_choices = torch.Tensor(
-            [i for i in itertools.product([0., 1.], repeat=n_features)],
-            device=inputs.device
-        )
+        y_choices = torch.Tensor([i for i in itertools.product([0., 1.], repeat=n_features)]).to(inputs.device)
 
         # p_labels: (n_features, [p_0, p_1])
         p_labels = self.p_labels()
-        p_labels = torch.stack([1-p_labels, p_labels]).transpose(0, 1)
+        p_labels = torch.stack([1-p_labels, p_labels]).transpose(0, 1).to(inputs.device)
 
         # p_y_choices: (n_choices)
-        p_y_choices = (torch.eye(2, device=inputs.device)[y_choices.long()] * p_labels.unsqueeze(0)).sum(2)
+        p_y_choices = (torch.eye(2).to(inputs.device)[y_choices.long()] * p_labels.unsqueeze(0)).sum(2)
         p_y_choices = p_y_choices.clamp_min(1e-6).log().sum(1)
 
         log_probs = []
         for y, log_p_y in zip(y_choices, p_y_choices):
             label_embedding = self.label_embedding(y)
-            hiddens = torch.cat([
+            hiddens = torch.cat((
                 out_states,
                 label_embedding.unsqueeze(0).unsqueeze(1).expand(n_batch, seq_len, -1)
-            ], -1)
+            ), -1)
             output_logits = self.dense_net(hiddens)
 
             # calculate p(x|y)p(y)

@@ -80,19 +80,23 @@ class ClassifierTrainer:
     def train(self, steps=1e8):
         self.model.train()
 
-        losses, accuracies, true_outputs, logits, rocs = self.validate()
-        print(f"val  losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}, "
-              f"accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}, "
-              f"logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}, "
-              f"AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}",
-              flush=True)
+        validation = self.validate()
+        if validation is not None:
+            losses, accuracies, true_outputs, logits, rocs = validation
+            print(f"val  losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}, "
+                  f"accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}, "
+                  f"logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}, "
+                  f"AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}",
+                  flush=True)
 
-        losses, accuracies, true_outputs, logits, rocs = self.test(num_samples=1)
-        print(f"test losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}, "
-              f"accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}, "
-              f"logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}, "
-              f"AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}",
-              flush=True)
+        testing = self.test(num_samples=1)
+        if testing is not None:
+            losses, accuracies, true_outputs, logits, rocs = testing
+            print(f"test losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}, "
+                  f"accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}, "
+                  f"logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}, "
+                  f"AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}",
+                  flush=True)
 
         pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
         data_iter = iter(self.loader)
@@ -253,7 +257,7 @@ class ClassifierTrainer:
         return losses, accuracies, true_outputs, logits, roc_scores
 
     def save_state(self, last_batch=None):
-        snapshot = f"{self.params['snapshot_path']}/{self.params['snapshot_name']}_{self.model.step}.pth"
+        snapshot = f"{self.params['snapshot_path']}/{self.params['snapshot_name']}/{self.model.step}.pth"
         revive_exec = f"{self.params['snapshot_path']}/revive_executable/{self.params['snapshot_name']}.sh"
         if not os.path.exists(os.path.dirname(snapshot)):
             os.makedirs(os.path.dirname(snapshot), exist_ok=True)
@@ -359,6 +363,25 @@ class GenerativeClassifierTrainer:
 
     def train(self, steps=1e8):
         self.model.train()
+        start_step = self.model.step
+
+        validation = self.validate()
+        if validation is not None:
+            losses, accuracies, true_outputs, logits, rocs = validation
+            print(f"val  losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}, "
+                  f"accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}, "
+                  f"logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}, "
+                  f"AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}",
+                  flush=True)
+
+        testing = self.test(num_samples=1)
+        if testing is not None:
+            losses, accuracies, true_outputs, logits, rocs = testing
+            print(f"test losses: {', '.join(['{:6.4f}'.format(loss) for loss in losses])}, "
+                  f"accuracies: {', '.join(['{:6.2f}%'.format(acc * 100) for acc in accuracies])}, "
+                  f"logits: {', '.join(['{:6.4f}'.format(logit) for logit in logits])}, "
+                  f"AUCs: {', '.join(['{:6.4f}'.format(roc) for roc in rocs])}",
+                  flush=True)
 
         try:
             pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
@@ -374,17 +397,14 @@ class GenerativeClassifierTrainer:
 
             batch = next(data_iter)
             for key in batch.keys():
-                batch[key] = batch[key].to(self.device, non_blocking=True)
+                if isinstance(batch[key], torch.Tensor):
+                    batch[key] = batch[key].to(self.device, non_blocking=True)
             # data_load_time = time.time()-start
 
             output_logits = self.model(batch['input'], batch['mask'], batch.get('label', None))
             losses = self.model.calculate_loss(output_logits, batch['decoder_output'], batch['mask'], n_eff=n_eff,
                                                labels=batch.get('label', None), pos_weight=pos_weights)
             del self.model.hidden
-
-            # loss = losses['loss']
-            # ce_loss = losses['ce_loss']
-            # bitperchar = losses['bitperchar']
 
             self.optimizer.zero_grad()
             losses['loss'].backward()
@@ -400,7 +420,7 @@ class GenerativeClassifierTrainer:
 
             self.optimizer.step()
 
-            if step % self.params['snapshot_interval'] == 0:
+            if (step-start_step) % self.params['snapshot_interval'] == 0:
                 if self.params['snapshot_path'] is not None:
                     self.save_state()
 
@@ -428,7 +448,8 @@ class GenerativeClassifierTrainer:
             accuracies = []
             for batch in loader:
                 for key in batch.keys():
-                    batch[key] = batch[key].to(self.device, non_blocking=True)
+                    if isinstance(batch[key], torch.Tensor):
+                        batch[key] = batch[key].to(self.device, non_blocking=True)
 
                 log_probs, y_choices = self.model.predict_all_y(batch['input'], batch['mask'], batch['decoder_output'])
                 output_logits = self.model.predict_logits(log_probs, y_choices)
@@ -461,50 +482,78 @@ class GenerativeClassifierTrainer:
         self.loader.dataset.unlimited_epoch = True
         return losses, accuracies, true_outputs, logits, roc_scores
 
-    def test(self, data_loader, model_eval=True, num_samples=1):  # TODO implement
+    def test(self, model_eval=True, num_samples=1, r_seed=42):
+        if isinstance(self.loader.dataset, IPISingleDataset) or isinstance(self.loader.dataset, IPIMultiDataset):
+            pass
+        else:
+            return None
+        self.model.eval()
         if model_eval:
             self.model.eval()
+        if isinstance(self.loader.dataset, TrainValTestDataset):
+            self.loader.dataset.test()
+        self.loader.dataset.unlimited_epoch = False
+        prev_state = enter_local_rng_state(r_seed)
 
-        print('    step  step-t  CE-loss     bit-per-char', flush=True)
-        for i_iter in range(num_samples):  # TODO implement sampling
-            output = {
-                'name': [],
-                'mean': [],
-                'bitperchar': [],
-                'sequence': []
-            }
+        loader = GeneratorDataLoader(self.loader.dataset, num_workers=self.loader.num_workers)
+        pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
+        n_eff = len(self.loader.dataset.cdr_seqs_train)
 
-            for i_batch, batch in enumerate(data_loader):
-                start = time.time()
+        true_outputs = []
+        sequences = []
+        logits = []
+        for i_iter in range(num_samples):
+            true_outputs = []
+            logits_i = []
+            sequences = []
+
+            for i_batch, batch in enumerate(loader):
                 for key in batch.keys():
                     if isinstance(batch[key], torch.Tensor):
                         batch[key] = batch[key].to(self.device, non_blocking=True)
 
                 with torch.no_grad():
-                    output_logits = self.model(batch['input'], batch['mask'])
-                    pred = self.model.predict(output_logits)
+                    log_probs, y_choices = self.model.predict_all_y(batch['input'], batch['mask'],
+                                                                    batch['decoder_output'])
+                    output_logits = self.model.predict_logits(log_probs, y_choices)
 
-                    ce_loss = losses['ce_loss_per_seq']
-                    if self.run_fr:
-                        ce_loss_mean = ce_loss.mean(0)
-                    else:
-                        ce_loss_mean = ce_loss
-                    ce_loss_per_char = ce_loss_mean / batch['prot_decoder_mask'].sum([1, 2, 3])
+                true_outputs.append(batch['label'])
+                sequences.extend(batch['sequences'])
+                logits_i.append(output_logits)
 
-                output['name'].extend(batch['names'])
-                output['sequence'].extend(batch['sequences'])
-                output['mean'].extend(ce_loss_mean.numpy())
-                output['bitperchar'].extend(ce_loss_per_char.numpy())
+            true_outputs = torch.cat(true_outputs, 0)
+            logits.append(torch.cat(logits_i, 0))
 
-                print("{: 8d} {:6.3f} {:11.6f} {:11.6f}".format(
-                    i_batch, time.time()-start, ce_loss_mean.mean(), ce_loss_per_char.mean()),
-                    flush=True)
+        logits = torch.stack(logits, 0).mean(0)
+
+        error = self.model.calculate_accuracy(
+            logits, true_outputs, reduction='none')
+        ce_loss = F.binary_cross_entropy_with_logits(
+            logits, true_outputs, pos_weight=pos_weights, reduction='none')
+
+        true_outputs = true_outputs.cpu().numpy()
+        logits = logits.cpu().numpy()
+        roc_scores = roc_auc_score(true_outputs, logits, average=None)
+        if isinstance(roc_scores, np.ndarray):
+            roc_scores = roc_scores.tolist()
+        else:
+            roc_scores = [roc_scores]
+
+        # TODO return output per test sequence as well
+        true_outputs = true_outputs.mean(0).tolist()
+        logits = logits.mean(0).tolist()
+        losses = ce_loss.mean(0).cpu().tolist()
+        accuracies = error.mean(0).cpu().tolist()
 
         self.model.train()
-        return output
+        if isinstance(self.loader.dataset, TrainValTestDataset):
+            self.loader.dataset.train()
+        self.loader.dataset.unlimited_epoch = True
+        exit_local_rng_state(prev_state)
+        return losses, accuracies, true_outputs, logits, roc_scores
 
     def save_state(self, last_batch=None):
-        snapshot = f"{self.params['snapshot_path']}/{self.params['snapshot_name']}_{self.model.step}.pth"
+        snapshot = f"{self.params['snapshot_path']}/{self.params['snapshot_name']}/{self.model.step}.pth"
         revive_exec = f"{self.params['snapshot_path']}/revive_executable/{self.params['snapshot_name']}.sh"
         if not os.path.exists(os.path.dirname(snapshot)):
             os.makedirs(os.path.dirname(snapshot), exist_ok=True)

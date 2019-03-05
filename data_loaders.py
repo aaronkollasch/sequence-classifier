@@ -5,7 +5,6 @@ import math
 import numpy as np
 import pandas as pd
 import torch
-import torch.distributions as dist
 import torch.utils.data as data
 from Bio.SeqIO.FastaIO import SimpleFastaParser
 
@@ -1270,7 +1269,7 @@ class VHClusteredAntibodyDataset(VHAntibodyDataset):
         return self.vh_list
 
     def load_data(self):
-        filename = self.working_dir + '/datasets/' + self.dataset
+        filename = os.path.join(self.working_dir, self.dataset)
         with open(filename, 'r') as fa:
             for i, (title, seq) in enumerate(SimpleFastaParser(fa)):
                 name, clu1, clu2 = title.split(':')
