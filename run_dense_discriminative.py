@@ -19,13 +19,9 @@ working_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
 data_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
 
 parser = argparse.ArgumentParser(description="Train an discriminative RNN classifier model.")
-parser.add_argument("--hidden-size", type=int, default=100,
-                    help="Number of channels in the RNN hidden state.")
-parser.add_argument("--num-layers", type=int, default=2,
-                    help="Number of RNN layers.")
-parser.add_argument("--hidden-size-dense", type=int, default=50,
+parser.add_argument("--hidden-size", type=int, default=50,
                     help="Number of channels in the dense hidden state.")
-parser.add_argument("--num-layers-dense", type=int, default=2,
+parser.add_argument("--num-layers", type=int, default=2,
                     help="Number of dense layers.")
 parser.add_argument("--num-iterations", type=int, default=250005,
                     help="Number of iterations to run the model.")
@@ -53,9 +49,7 @@ parser.add_argument("--run-name", type=str, default=None,
                     help="Name of run")
 parser.add_argument("--r-seed", type=int, default=42,
                     help="Random seed")
-parser.add_argument("--dropout-p-rnn", type=float, default=0.2,
-                    help="Dropout probability (drop rate, not keep rate)")
-parser.add_argument("--dropout-p-dense", type=float, default=0.5,
+parser.add_argument("--dropout-p", type=float, default=0.5,
                     help="Dropout probability (drop rate, not keep rate)")
 parser.add_argument("--bayes-reg", action='store_true',
                     help="Use bayesian weight uncertainty")
@@ -68,9 +62,7 @@ if len(args.test_datasets) == 0:
 
 if args.run_name is None:
     args.run_name = f"{args.dataset.split('/')[-1].split('.')[0]}" \
-        f"_n-r-{args.num_layers}-d-{args.num_layers_dense}" \
-        f"_h-r-{args.hidden_size}-d-{args.hidden_size_dense}" \
-        f"_drop-r-{args.dropout_p_rnn}-d-{args.dropout_p_dense}" \
+        f"_dense_n-{args.num_layers}_h-{args.hidden_size}_drop-{args.dropout_p}" \
         f"_reg-{'bayes' if args.bayes_reg else'l2'}" \
         f"_test-{','.join(args.test_datasets)}" \
         f"_rseed-{args.r_seed}_start-{time.strftime('%y%b%d_%H%M', time.localtime())}"
@@ -151,7 +143,7 @@ dataset = data_loaders.IPIMultiDataset(
         ),
     ),
     output_shape='NLC',
-    output_types='encoder',
+    output_types='kmer_vector',
 )
 loader = data_loaders.GeneratorDataLoader(
     dataset,
@@ -166,28 +158,23 @@ if args.restore is not None:
     dims = checkpoint['model_dims']
     hyperparams = checkpoint['model_hyperparams']
     trainer_params = checkpoint['train_params']
-    if args.dropout_p_rnn is not None:
-        hyperparams['rnn']['dropout_p'] = args.dropout_p_rnn
-    if args.dropout_p_dense is not None:
-        hyperparams['dense']['dropout_p'] = args.dropout_p_dense
-    model = models.DiscriminativeRNN(dims=dims, hyperparams=hyperparams)
+    if args.dropout_p is not None:
+        hyperparams['dense']['dropout_p'] = args.dropout_p
+    model = models.DiscriminativeDense(dims=dims, hyperparams=hyperparams)
 else:
     checkpoint = args.restore
     trainer_params = None
-    dims = {'input': dataset.input_dim}
-    hyperparams = {'rnn': {}, 'dense': {}, 'regularization': {}}
+    dims = {'length': 1, 'input': len(dataset.kmer_to_idx)}
+    hyperparams = {'dense': {}, 'regularization': {}}
     for param_name_1, param_name_2, param in (
-        ('rnn', 'hidden_size', args.hidden_size),
-        ('rnn', 'num_layers', args.num_layers),
-        ('rnn', 'dropout_p', args.dropout_p_rnn),
-        ('dense', 'hidden_size', args.hidden_size_dense),
-        ('dense', 'num_layers', args.num_layers_dense),
-        ('dense', 'dropout_p', args.dropout_p_dense),
+        ('dense', 'hidden_size', args.hidden_size),
+        ('dense', 'num_layers', args.num_layers),
+        ('dense', 'dropout_p', args.dropout_p),
         ('regularization', 'bayesian', args.bayes_reg)
     ):
         if param is not None:
             hyperparams[param_name_1][param_name_2] = param
-    model = models.DiscriminativeRNN(dims=dims, hyperparams=hyperparams)
+    model = models.DiscriminativeDense(dims=dims, hyperparams=hyperparams)
 model.to(device)
 
 trainer = trainers.ClassifierTrainer(
@@ -201,10 +188,10 @@ trainer = trainers.ClassifierTrainer(
     device=device,
     # logger=model_logging.Logger(),
     logger=model_logging.TensorboardLogger(
-        log_interval=500,
-        validation_interval=2500,
-        generate_interval=2500,
-        test_interval=2500,
+        log_interval=100,
+        validation_interval=500,
+        generate_interval=500,
+        test_interval=500,
         log_dir=working_dir + '/logs/' + args.run_name,
         print_output=True
     )

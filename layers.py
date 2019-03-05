@@ -1,3 +1,5 @@
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -159,9 +161,9 @@ class GRU(nn.GRU):
 class BayesianGRU(nn.GRU):
     def __init__(self, *args, **kwargs):
         self.hyperparams = kwargs.pop('hyperparams')
+        self.regularizers = {}
         nn.GRU.__init__(self, *args, **kwargs)
 
-        self.regularizers = {}
         names = [name for name, _ in self.named_parameters()]
         for name in names:
             regularizer = GaussianWeightUncertainty(name, self.hyperparams['regularization'])
@@ -176,11 +178,20 @@ class BayesianGRU(nn.GRU):
         for regularizer in self.regularizers.values():
             regularizer(self, stddev=stddev)
 
-        output = nn.GRU.forward(self, x, hx)
+        with warnings.catch_warnings():
+            # We recalculate the weights at every call so there's no point flattening; ignore this warning.
+            warnings.simplefilter("ignore")
+            output = nn.GRU.forward(self, x, hx)
         return output
 
+    def flatten_parameters(self):
+        # Prevents RuntimeError: _cudnn_rnn_flatten_weight not supported on torch.FloatTensor
+        return
+
     @property
-    def _flat_weights(self):  # redefine necessary to prevent nn.GRU from using the wrong weights
+    def _flat_weights(self):
+        # redefine necessary to prevent nn.GRU from using the wrong weights
+        # fixed in pytorch 1.0.1
         return [p for layerparams in self.all_weights for p in layerparams]
 
     @property

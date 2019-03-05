@@ -1,6 +1,7 @@
 import os
 import glob
 import math
+import itertools
 
 import numpy as np
 import pandas as pd
@@ -175,6 +176,39 @@ def sequences_to_encoder_onehot(sequences, char_map, start_char='', end_char='')
     return encoder_input, encoder_mask
 
 
+def get_kmer_list(seq, max_k):
+    kmer_counts = {}
+    for kmer_len in range(1, max_k + 1):
+        num_chunks = (len(seq) - kmer_len) + 1
+        for idx in range(0, num_chunks):
+            kmer = seq[idx:idx + kmer_len]
+            if kmer in kmer_counts:
+                kmer_counts[kmer] += 1
+            else:
+                kmer_counts[kmer] = 1
+    return kmer_counts
+
+
+def sequences_to_kmer_vector(sequences, kmer_to_idx, max_k=3, normalize=True):
+    num_seqs = len(sequences)
+    kmer_arr = np.zeros((num_seqs, len(kmer_to_idx)), dtype=np.float32)
+
+    for i, seq in enumerate(sequences):
+        kmer_data_list = get_kmer_list(seq, max_k)
+
+        if normalize:  # L2 normalize
+            norm_val = 0.
+            for count in kmer_data_list.values():
+                norm_val += (count * count)
+            norm_val = math.sqrt(norm_val)
+        else:
+            norm_val = 1.
+
+        for kmer, count in kmer_data_list.items():
+            kmer_arr[i, kmer_to_idx[kmer]] = count / norm_val
+    return kmer_arr
+
+
 class SequenceDataset(GeneratorDataset):
     """Abstract sequence dataset"""
     SUPPORTED_OUTPUT_SHAPES = ['NCHW', 'NHWC', 'NLC']
@@ -187,7 +221,8 @@ class SequenceDataset(GeneratorDataset):
             reverse=False,
             matching=False,
             output_shape='NCHW',
-            output_types='decoder,encoder',
+            output_types='decoder,encoder,kmer_vector',
+            max_k=3,
     ):
         super(SequenceDataset, self).__init__(batch_size=batch_size, unlimited_epoch=unlimited_epoch)
 
@@ -196,12 +231,17 @@ class SequenceDataset(GeneratorDataset):
         self.matching = matching
         self.output_shape = output_shape
         self.output_types = output_types
+        self.max_k = max_k
 
         if output_shape not in self.SUPPORTED_OUTPUT_SHAPES:
             raise KeyError(f'Unsupported output shape: {output_shape}')
 
         self.aa_dict = self.idx_to_aa = self.output_aa_dict = self.output_idx_to_aa = None
         self.update_aa_dict()
+
+        self.kmer_to_idx = None
+        if 'kmer_vector' in output_types:
+            self.update_kmer_dict()
 
     @property
     def params(self):
@@ -212,6 +252,7 @@ class SequenceDataset(GeneratorDataset):
             "matching": self.matching,
             "output_shape": self.output_shape,
             "output_types": self.output_types,
+            "max_k": self.max_k
         })
         return params
 
@@ -229,6 +270,10 @@ class SequenceDataset(GeneratorDataset):
             self.output_shape = d['output_shape']
         if 'output_types' in d:
             self.output_types = d['output_types']
+        if 'max_k' in d:
+            self.max_k = d['max_k']
+            if 'kmer_vector' in self.output_types:
+                self.update_kmer_dict()
 
     @property
     def alphabet(self):
@@ -248,6 +293,13 @@ class SequenceDataset(GeneratorDataset):
         self.idx_to_aa = {i: aa for i, aa in enumerate(self.alphabet)}
         self.output_aa_dict = {aa: i for i, aa in enumerate(self.output_alphabet)}
         self.output_idx_to_aa = {i: aa for i, aa in enumerate(self.output_alphabet)}
+
+    def update_kmer_dict(self):
+        kmer_list = []
+        for k in range(1, self.max_k + 1):
+            kmer_list += [''.join(tup) for tup in itertools.product(self.alphabet.replace('*', ''), repeat=k)]
+        self.kmer_to_idx = {aa: i for i, aa in enumerate(kmer_list)}
+        print("Num kmers:", len(kmer_list))
 
     @property
     def n_eff(self):
@@ -293,6 +345,9 @@ class SequenceDataset(GeneratorDataset):
                 'encoder_input': encoder_input,
                 'encoder_mask': encoder_mask
             })
+        if 'kmer_vector' in self.output_types:
+            kmer_arr = sequences_to_kmer_vector(sequences, self.kmer_to_idx, max_k=self.max_k)
+            output['kmer_vector'] = kmer_arr.reshape((len(sequences), -1, 1, 1))
 
         for key in output.keys():
             output[key] = torch.as_tensor(output[key], dtype=torch.float32)
@@ -317,6 +372,7 @@ class FastaDataset(SequenceDataset):
             matching=False,
             output_shape='NCHW',
             output_types='decoder',
+            max_k=3,
     ):
         super(FastaDataset, self).__init__(
             batch_size=batch_size,
@@ -326,6 +382,7 @@ class FastaDataset(SequenceDataset):
             matching=matching,
             output_shape=output_shape,
             output_types=output_types,
+            max_k=max_k,
         )
         self.dataset = dataset
         self.working_dir = working_dir
@@ -393,6 +450,7 @@ class SingleFamilyDataset(SequenceDataset):
             matching=False,
             output_shape='NCHW',
             output_types='decoder',
+            max_k=3,
     ):
         super(SingleFamilyDataset, self).__init__(
             batch_size=batch_size,
@@ -402,6 +460,7 @@ class SingleFamilyDataset(SequenceDataset):
             matching=matching,
             output_shape=output_shape,
             output_types=output_types,
+            max_k=max_k,
         )
         self.dataset = dataset
         self.working_dir = working_dir
@@ -515,6 +574,7 @@ class DoubleWeightedNanobodyDataset(SequenceDataset):
             matching=False,
             output_shape='NCHW',
             output_types='decoder',
+            max_k=3,
     ):
         super(DoubleWeightedNanobodyDataset, self).__init__(
             batch_size=batch_size,
@@ -524,6 +584,7 @@ class DoubleWeightedNanobodyDataset(SequenceDataset):
             matching=matching,
             output_shape=output_shape,
             output_types=output_types,
+            max_k=max_k,
         )
         self.dataset = dataset
         self.working_dir = working_dir
@@ -606,6 +667,7 @@ class AntibodySequenceDataset(SequenceDataset):
             matching=False,
             output_shape='NLC',
             output_types='encoder',
+            max_k=3,
             include_vl=False,
             include_vh=False,
     ):
@@ -618,6 +680,7 @@ class AntibodySequenceDataset(SequenceDataset):
             matching=matching,
             output_shape=output_shape,
             output_types=output_types,
+            max_k=max_k,
         )
         self.dataset = dataset
         self.working_dir = working_dir
@@ -685,6 +748,10 @@ class AntibodySequenceDataset(SequenceDataset):
             seq_arr, seq_output_arr, seq_mask, _, _ = sequences_to_decoder_onehot(
                 sequences, self.aa_dict, self.output_aa_dict, reverse=reverse, matching=False
             )
+        elif 'kmer_vector' in self.output_types:
+            kmer_arr = sequences_to_kmer_vector(sequences, self.kmer_to_idx, max_k=self.max_k)
+            seq_arr = kmer_arr.reshape((len(sequences), -1, 1, 1))
+            seq_mask = seq_output_arr = None
         else:
             seq_arr, seq_mask = sequences_to_encoder_onehot(sequences, self.aa_dict)
             seq_output_arr = None
@@ -702,14 +769,14 @@ class AntibodySequenceDataset(SequenceDataset):
                 heavy_arr[i, self.heavy_to_idx[vhs[i]], 0, :] = 1.
 
         if self.include_vl:
-            seq_arr = np.concatenate((seq_arr, light_arr), axis=-1)
+            seq_arr = np.concatenate((seq_arr, light_arr), axis=1)
         if self.include_vh:
-            seq_arr = np.concatenate((seq_arr, heavy_arr), axis=-1)
+            seq_arr = np.concatenate((seq_arr, heavy_arr), axis=1)
 
-        output = {'input': seq_arr, 'mask': seq_mask}
-        if 'decoder' in self.output_types:
-            output['decoder_output'] = seq_output_arr
+        output = {'input': seq_arr, 'mask': seq_mask, 'decoder_output': seq_output_arr}
         for key in output.keys():
+            if output[key] is None:
+                continue
             output[key] = torch.as_tensor(output[key], dtype=torch.float32)
             if self.output_shape == 'NHWC':
                 output[key] = output[key].permute(0, 2, 3, 1).contiguous()
@@ -739,6 +806,7 @@ class IPISingleDataset(AntibodySequenceDataset, TrainValTestDataset):
             matching=False,
             output_shape='NLC',
             output_types='encoder',
+            max_k=3,
             comparisons=(('Aff1', 'PSR1', 0., 0.),),  # before, after, thresh_before, thresh_after
             train_val_split=1.0,
             split_seed=42,
@@ -754,6 +822,7 @@ class IPISingleDataset(AntibodySequenceDataset, TrainValTestDataset):
             matching=matching,
             output_shape=output_shape,
             output_types=output_types,
+            max_k=max_k,
             include_vl=include_vl,
             include_vh=include_vh,
         )
@@ -899,6 +968,7 @@ class IPIMultiDataset(AntibodySequenceDataset, TrainValTestDataset):
             matching=False,
             output_shape='NLC',
             output_types='encoder',
+            max_k=3,
             comparisons=(('Aff1', 'PSR1', 0., 0.),),  # before, after, thresh_before, thresh_after
             train_val_split=1.0,
             split_seed=42,
@@ -914,6 +984,7 @@ class IPIMultiDataset(AntibodySequenceDataset, TrainValTestDataset):
             matching=matching,
             output_shape=output_shape,
             output_types=output_types,
+            max_k=max_k,
             include_vl=include_vl,
             include_vh=include_vh,
         )
@@ -1072,6 +1143,7 @@ class VHAntibodyDataset(AntibodySequenceDataset):
             matching=False,
             output_shape='NLC',
             output_types='encoder',
+            max_k=3,
             include_vh=False,
             vh_set_name='IPI',
     ):
@@ -1083,6 +1155,7 @@ class VHAntibodyDataset(AntibodySequenceDataset):
             matching=matching,
             output_shape=output_shape,
             output_types=output_types,
+            max_k=max_k,
             include_vl=False,
             include_vh=include_vh,
         )

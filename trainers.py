@@ -116,7 +116,8 @@ class ClassifierTrainer:
             output_logits = self.model(batch['input'], batch['mask'])
             losses = self.model.calculate_loss(output_logits, batch['label'], n_eff=n_eff, pos_weight=pos_weights)
             accuracy = self.model.calculate_accuracy(output_logits, batch['label'])
-            del self.model.hidden
+            if hasattr(self.model, 'hidden'):
+                del self.model.hidden
 
             self.optimizer.zero_grad()
             losses['loss'].backward()

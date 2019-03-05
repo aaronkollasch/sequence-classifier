@@ -15,8 +15,8 @@ import trainers
 import model_logging
 from utils import get_cuda_version, get_cudnn_version
 
-# working_dir = '/n/groups/marks/projects/antibodies/rnn-classifier/code'
-# data_dir = '/n/groups/marks/projects/antibodies/rnn-classifier/code'
+# working_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
+# data_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
 working_dir = '.'
 data_dir = '.'
 
