@@ -18,12 +18,17 @@ from utils import get_cuda_version, get_cudnn_version
 working_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
 data_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
 
-parser = argparse.ArgumentParser(description="Train an discriminative RNN classifier model.")
+
+##################
+# LOAD ARGUMENTS #
+##################
+
+parser = argparse.ArgumentParser(description="Train a dense discriminative classifier model.")
 parser.add_argument("--hidden-size", type=int, default=50,
                     help="Number of channels in the dense hidden state.")
 parser.add_argument("--num-layers", type=int, default=2,
                     help="Number of dense layers.")
-parser.add_argument("--num-iterations", type=int, default=250005,
+parser.add_argument("--num-iterations", type=int, default=100000,
                     help="Number of iterations to run the model.")
 parser.add_argument("--batch-size", type=int, default=32,
                     help="Batch size.")
@@ -41,6 +46,10 @@ parser.add_argument("--include-vl", action='store_true',
                     help="Include an encoding of the VL gene in the input.")
 parser.add_argument("--include-vh", action='store_true',
                     help="Include an encoding of the VH gene in the input.")
+parser.add_argument("--max-k", type=int, default=3,
+                    help="Maximum k-mer size.")
+parser.add_argument("--include-length", action='store_true',
+                    help="Include the CDR3 length as a feature in the k-mer vector.")
 parser.add_argument("--num-data-workers", type=int, default=4,
                     help="Number of workers to load data")
 parser.add_argument("--restore", type=str, default=None,
@@ -59,6 +68,11 @@ args = parser.parse_args()
 
 if len(args.test_datasets) == 0:
     warnings.warn('No test datasets specified.')
+
+
+########################
+# MAKE RUN DESCRIPTORS #
+########################
 
 if args.run_name is None:
     args.run_name = f"{args.dataset.split('/')[-1].split('.')[0]}" \
@@ -89,6 +103,11 @@ srun stdbuf -oL -eL {sys.executable} \\
   --restore {{restore}}
 """
 
+
+####################
+# SET RANDOM SEEDS #
+####################
+
 if args.restore is not None:
     # prevent from repeating batches/seed when restoring at intermediate point
     # script is repeatable as long as restored at same point with same restore string
@@ -103,6 +122,10 @@ torch.cuda.manual_seed_all(args.r_seed)
 def _init_fn(worker_id):
     np.random.seed(args.r_seed + worker_id)
 
+
+#####################
+# PRINT SYSTEM INFO #
+#####################
 
 print("OS: ", sys.platform)
 print("Python: ", sys.version)
@@ -120,6 +143,11 @@ if device.type == 'cuda':
     print(get_cuda_version())
     print("CuDNN Version ", get_cudnn_version())
 print()
+
+
+#############
+# LOAD DATA #
+#############
 
 print("Run:", args.run_name)
 
@@ -144,6 +172,7 @@ dataset = data_loaders.IPIMultiDataset(
     ),
     output_shape='NLC',
     output_types='kmer_vector',
+    kmer_params=dict(max_k=args.max_k, include_length=args.include_length),
 )
 loader = data_loaders.GeneratorDataLoader(
     dataset,
@@ -151,6 +180,11 @@ loader = data_loaders.GeneratorDataLoader(
     pin_memory=True,
     worker_init_fn=_init_fn
 )
+
+
+##############
+# LOAD MODEL #
+##############
 
 if args.restore is not None:
     print("Restoring model from:", args.restore)
@@ -164,7 +198,7 @@ if args.restore is not None:
 else:
     checkpoint = args.restore
     trainer_params = None
-    dims = {'length': 1, 'input': len(dataset.kmer_to_idx)}
+    dims = {'length': 1, 'input': dataset.input_dim}
     hyperparams = {'dense': {}, 'regularization': {}}
     for param_name_1, param_name_2, param in (
         ('dense', 'hidden_size', args.hidden_size),
@@ -176,6 +210,11 @@ else:
             hyperparams[param_name_1][param_name_2] = param
     model = models.DiscriminativeDense(dims=dims, hyperparams=hyperparams)
 model.to(device)
+
+
+################
+# RUN TRAINING #
+################
 
 trainer = trainers.ClassifierTrainer(
     model=model,
@@ -211,3 +250,6 @@ print("Num trainable parameters:", model.parameter_count())
 print(f"Training for {args.num_iterations - model.step} iterations.")
 
 trainer.train(steps=args.num_iterations)
+
+print(model.dense_net_modules['linear_1'].weight)
+print(model.dense_net_modules['linear_1'].bias)

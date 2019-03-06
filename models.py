@@ -622,7 +622,7 @@ class GenerativeRNN(Model):
 
 class DiscriminativeDense(Model):
     """A dense discriminative model. Equivalent to regression when num_layers == 1."""
-    MODEL_TYPE = 'discriminative_dense'
+    MODEL_TYPE = 'dense_discriminative'
     DEFAULT_DIMS = {
         "batch": 10,
         "alphabet": 21,
@@ -654,8 +654,8 @@ class DiscriminativeDense(Model):
             'prior_params': None,
         },
         'optimization': {
-            'optimizer': 'Adam',
-            'lr': 0.001,
+            'optimizer': 'SGD',
+            'lr': 0.01,
             'weight_decay': 0,  # trainer will divide by n_eff before using
             'clip': 10.0,
         }

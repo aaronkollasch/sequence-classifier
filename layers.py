@@ -191,7 +191,7 @@ class BayesianGRU(nn.GRU):
     @property
     def _flat_weights(self):
         # redefine necessary to prevent nn.GRU from using the wrong weights
-        # fixed in pytorch 1.0.1
+        # fix included in PyTorch 1.0.1
         return [p for layerparams in self.all_weights for p in layerparams]
 
     @property
