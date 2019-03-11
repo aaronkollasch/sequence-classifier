@@ -199,11 +199,15 @@ def sequences_to_kmer_vector(sequences, kmer_to_idx, max_k=3, normalize=True, in
     for i, seq in enumerate(sequences):
         kmer_data_list = get_kmer_list(seq, max_k)
 
-        if normalize:  # L2 normalize
+        if normalize in [True, 'l2']:  # L2 normalize
             norm_val = 0.
             for count in kmer_data_list.values():
                 norm_val += (count * count)
             norm_val = math.sqrt(norm_val)
+        elif normalize == 'l1':
+            norm_val = 0.
+            for count in kmer_data_list.values():
+                norm_val += count
         else:
             norm_val = 1.
 
@@ -237,7 +241,6 @@ class SequenceDataset(GeneratorDataset):
         self.matching = matching
         self.output_shape = output_shape
         self.output_types = output_types
-        self.kmer_params = kmer_params
 
         if output_shape not in self.SUPPORTED_OUTPUT_SHAPES:
             raise KeyError(f'Unsupported output shape: {output_shape}')
@@ -247,9 +250,11 @@ class SequenceDataset(GeneratorDataset):
 
         self.kmer_to_idx = None
         if 'kmer_vector' in output_types:
-            self.kmer_params = self.DEFAULT_KMER_PARAMS.copy().update(
-                self.kmer_params if self.kmer_params is not None else {})
+            self.kmer_params = self.DEFAULT_KMER_PARAMS.copy()
+            self.kmer_params.update(kmer_params if kmer_params is not None else {})
             self.update_kmer_dict()
+        else:
+            self.kmer_params = kmer_params
 
     @property
     def params(self):
@@ -281,8 +286,8 @@ class SequenceDataset(GeneratorDataset):
         if 'kmer_params' in d:
             self.kmer_params = d['kmer_params']
             if 'kmer_vector' in self.output_types:
-                self.kmer_params = self.DEFAULT_KMER_PARAMS.copy().update(
-                    self.kmer_params if self.kmer_params is not None else {})
+                self.kmer_params = self.DEFAULT_KMER_PARAMS.copy()
+                self.kmer_params.update(self.kmer_params if self.kmer_params is not None else {})
                 self.update_kmer_dict()
 
     @property
@@ -718,6 +723,8 @@ class AntibodySequenceDataset(SequenceDataset):
     def input_dim(self):
         if 'kmer_vector' in self.output_types:
             input_dim = len(self.kmer_to_idx)
+            if self.kmer_params['include_length']:
+                input_dim += 1
         else:
             input_dim = len(self.alphabet)
         if self.include_vl:
@@ -754,8 +761,11 @@ class AntibodySequenceDataset(SequenceDataset):
     def sequences_to_onehot(self, sequences, vls=None, vhs=None, reverse=None, matching=None):
         num_seqs = len(sequences)
         for i in range(num_seqs):
+            # normalize CDR3 sequences to exclude constant characters
             if sequences[i][0] == 'C':
                 sequences[i] = sequences[i][1:]
+            if sequences[i][-1] == 'W':
+                sequences[i] = sequences[i][:-1]
 
         if 'decoder' in self.output_types:
             seq_arr, seq_output_arr, seq_mask, _, _ = sequences_to_decoder_onehot(
@@ -763,7 +773,7 @@ class AntibodySequenceDataset(SequenceDataset):
             )
         elif 'kmer_vector' in self.output_types:
             kmer_arr = sequences_to_kmer_vector(sequences, self.kmer_to_idx, **self.kmer_params)
-            seq_arr = kmer_arr.reshape((len(sequences), -1, 1, 1))
+            seq_arr = kmer_arr.reshape((num_seqs, -1, 1, 1))
             seq_mask = seq_output_arr = None
         else:
             seq_arr, seq_mask = sequences_to_encoder_onehot(sequences, self.aa_dict)

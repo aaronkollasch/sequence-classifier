@@ -10,18 +10,20 @@ import torch.nn.functional as F
 
 from functions import Nonlinearity, l2_normalize
 from utils import recursive_update
+from functions import make_1d_mask, make_2d_mask
 import layers
+import transformer_layers as t_layers
 
 
 class Model(nn.Module):
-    """Abstract RNN class."""
+    """Abstract Model."""
     MODEL_TYPE = 'abstract_model'
     DEFAULT_DIMS = {
         "batch": 10,
         "alphabet": 21,
         "length": 256
     }
-    DEFAULT_PARAMS = {}
+    DEFAULT_PARAMS: Dict[str, Dict[str, Union[int, bool, float, str, Sequence]]] = {}
 
     def __init__(self, dims=None, hyperparams=None):
         super(Model, self).__init__()
@@ -50,8 +52,34 @@ class Model(nn.Module):
     def parameter_count(self):
         return sum(param.numel() for param in self.parameters())
 
+    def trainable_parameter_count(self):
+        return sum(param.numel() for param in self.parameters() if param.requires_grad)
 
-class DiscriminativeRNN(Model):
+
+class DiscriminativeModel(Model):
+    def __init__(self, dims=None, hyperparams=None):
+        Model.__init__(self, dims=dims, hyperparams=hyperparams)
+
+    def forward(self, *args):
+        raise NotImplementedError
+
+    def weight_costs(self):
+        raise NotImplementedError
+
+    @staticmethod
+    def predict(logits, threshold=0.5):
+        return (logits.sigmoid() > threshold).float()
+
+    @staticmethod
+    def calculate_accuracy(logits, targets, threshold=0.5, reduction='mean'):
+        error = 1 - (targets - (logits.sigmoid() > threshold).float()).abs()
+        if reduction == 'mean':
+            return error.mean()
+        else:
+            return error
+
+
+class DiscriminativeRNN(DiscriminativeModel):
     MODEL_TYPE = 'discriminative_rnn'
     DEFAULT_PARAMS = {
         'rnn': {
@@ -94,7 +122,7 @@ class DiscriminativeRNN(Model):
     }
 
     def __init__(self, dims=None, hyperparams=None):
-        Model.__init__(self, dims=dims, hyperparams=hyperparams)
+        DiscriminativeModel.__init__(self, dims=dims, hyperparams=hyperparams)
 
         if self.hyperparams['regularization']['bayesian']:
             self.hyperparams['regularization']['l2'] = False
@@ -232,18 +260,6 @@ class DiscriminativeRNN(Model):
             'loss': loss,
             'ce_loss': ce_loss
         }
-
-    @staticmethod
-    def predict(logits, threshold=0.5):
-        return (logits.sigmoid() > threshold).float()
-
-    @staticmethod
-    def calculate_accuracy(logits, targets, threshold=0.5, reduction='mean'):
-        error = 1 - (targets - (logits.sigmoid() > threshold).float()).abs()
-        if reduction == 'mean':
-            return error.mean()
-        else:
-            return error
 
 
 class GenerativeRNN(Model):
@@ -518,6 +534,9 @@ class GenerativeRNN(Model):
                 weights_per_seq = (labels * pos_weight.unsqueeze(0) + (1-labels)).prod(1)
                 loss_per_seq = reconstruction_loss['ce_loss_per_seq'] * weights_per_seq
                 loss = loss_per_seq.mean()
+            else:
+                loss_per_seq = reconstruction_loss['ce_loss_per_seq']
+                loss = loss_per_seq.mean()
         else:
             loss_per_seq = reconstruction_loss['ce_loss_per_seq']
             loss = reconstruction_loss['ce_loss']
@@ -565,11 +584,11 @@ class GenerativeRNN(Model):
         out_states, self.hidden = self.rnn(x, self.hidden, step=self.step)
 
         # y_choices: (n_choices, n_features)
-        y_choices = torch.Tensor([i for i in itertools.product([0., 1.], repeat=n_features)]).to(inputs.device)
+        y_choices = torch.tensor([tup for tup in itertools.product([0., 1.], repeat=n_features)]).to(inputs.device)
 
         # p_labels: (n_features, [p_0, p_1])
         p_labels = self.p_labels()
-        p_labels = torch.stack([1-p_labels, p_labels]).transpose(0, 1).to(inputs.device)
+        p_labels = torch.stack((1-p_labels, p_labels)).transpose(0, 1).to(inputs.device)
 
         # p_y_choices: (n_choices)
         p_y_choices = (torch.eye(2).to(inputs.device)[y_choices.long()] * p_labels.unsqueeze(0)).sum(2)
@@ -620,9 +639,9 @@ class GenerativeRNN(Model):
             return error
 
 
-class DiscriminativeDense(Model):
+class DiscriminativeDense(DiscriminativeModel):
     """A dense discriminative model. Equivalent to regression when num_layers == 1."""
-    MODEL_TYPE = 'dense_discriminative'
+    MODEL_TYPE = 'discriminative_dense'
     DEFAULT_DIMS = {
         "batch": 10,
         "alphabet": 21,
@@ -662,7 +681,7 @@ class DiscriminativeDense(Model):
     }
 
     def __init__(self, dims=None, hyperparams=None):
-        Model.__init__(self, dims=dims, hyperparams=hyperparams)
+        DiscriminativeModel.__init__(self, dims=dims, hyperparams=hyperparams)
 
         if self.hyperparams['regularization']['bayesian']:
             self.hyperparams['regularization']['l2'] = False
@@ -676,7 +695,7 @@ class DiscriminativeDense(Model):
             elif self.hyperparams['regularization']['prior_type'] == 'scale_mix_gaussian':
                 self.hyperparams['regularization']['prior_params'] = (0.1, 0., 1., 0., 0.001)
             elif self.hyperparams['regularization']['prior_type'] == 'laplacian':
-                pass  # TODO implement laplacian prior
+                self.hyperparams['regularization']['prior_params'] = (0., 1.)
 
         if self.hyperparams['regularization']['bayesian'] and (
             self.hyperparams['dense']['dropout_p'] > 0
@@ -755,14 +774,182 @@ class DiscriminativeDense(Model):
             'ce_loss': ce_loss
         }
 
-    @staticmethod
-    def predict(logits, threshold=0.5):
-        return (logits.sigmoid() > threshold).float()
 
-    @staticmethod
-    def calculate_accuracy(logits, targets, threshold=0.5, reduction='mean'):
-        error = 1 - (targets - (logits.sigmoid() > threshold).float()).abs()
-        if reduction == 'mean':
-            return error.mean()
+class DiscriminativeTransformer(DiscriminativeModel):
+    MODEL_TYPE = 'discriminative_transformer'
+    DEFAULT_PARAMS = {
+        'transformer': {
+            'd_model': 128,
+            'd_ff': 512,
+            'num_heads': 4,
+            'num_layers': 3,
+            'dropout_p': 0.1,
+            'use_output': 'global_avg',  # global_avg, global_max
+        },
+        'dense': {
+            'num_layers': 1,
+            'hidden_size': 50,
+            'output_features': 1,
+            'nonlinearity': 'relu',
+            'normalization': 'batch',
+            'dropout_p': 0.5,
+            'ordering': ['nonlin', 'norm', 'dropout', 'linear'],
+        },
+        'sampler_hyperparams': {
+            'warm_up': 10000,
+            'annealing_type': 'linear',
+            'anneal_kl': True,
+            'anneal_noise': True
+        },
+        'regularization': {
+            'l2': True,
+            'l2_lambda': 1.,
+            'bayesian': False,  # if True, disables l2 regularization
+            'bayesian_lambda': 0.1,
+            'rho_type': 'log_sigma',  # lin_sigma, log_sigma
+            'prior_type': 'gaussian',  # gaussian, scale_mix_gaussian
+            'prior_params': None,
+        },
+        'optimization': {
+            'optimizer': 'Adam',
+            'lr': 0.001,
+            'weight_decay': 0,  # trainer will divide by n_eff before using
+            'clip': 10.0,
+            'opt_params': {
+                'betas': (0.9, 0.98),
+                'eps': 1e-9,
+            },
+            'lr_schedule': True,
+        }
+    }
+
+    def __init__(self, dims=None, hyperparams=None):
+        DiscriminativeModel.__init__(self, dims=dims, hyperparams=hyperparams)
+
+        if self.hyperparams['regularization']['bayesian']:
+            self.hyperparams['regularization']['l2'] = False
+        elif self.hyperparams['regularization']['l2']:
+            # torch built-in weight decay is more efficient than manual calculation
+            self.hyperparams['optimization']['weight_decay'] = self.hyperparams['regularization']['l2_lambda']
+
+        if self.hyperparams['regularization']['prior_params'] is None:
+            if self.hyperparams['regularization']['prior_type'] == 'gaussian':
+                self.hyperparams['regularization']['prior_params'] = (0., 1.)
+            elif self.hyperparams['regularization']['prior_type'] == 'scale_mix_gaussian':
+                self.hyperparams['regularization']['prior_params'] = (0.1, 0., 1., 0., 0.001)
+
+        if self.hyperparams['regularization']['bayesian'] and self.hyperparams['transformer']['dropout_p'] > 0:
+            warnings.warn("Using both weight uncertainty and dropout")
+
+        params = self.hyperparams['transformer']
+        n = params['num_layers']
+        d_model = params['d_model']
+        d_ff = params['d_ff']
+        h = params['num_heads']
+        dropout = params['dropout_p']
+        c = deepcopy
+        attn = t_layers.MultiHeadedAttention(h, d_model, dropout)
+        ff = t_layers.PositionwiseFeedForward(d_model, d_ff, dropout)
+        position = t_layers.PositionalEncoding(d_model, dropout)
+
+        self.encoder = t_layers.Encoder(t_layers.EncoderLayer(d_model, c(attn), c(ff), dropout), n)
+        self.src_embed = nn.Sequential(t_layers.Embeddings(d_model, self.dims['input']), c(position))
+
+        dense_params = self.hyperparams['dense']
+        dense_net = OrderedDict()
+        norm = None
+        if self.hyperparams['regularization']['bayesian']:
+            linear = layers.BayesianLinear
+            if dense_params['normalization'] == 'batch':
+                norm = layers.BayesianBatchNorm1d
+            bayesian_params = {
+                'sampler_hyperparams': self.hyperparams['sampler_hyperparams'],
+                'regularization': self.hyperparams['regularization']
+            }
         else:
-            return error
+            linear = layers.Linear
+            if dense_params['normalization'] == 'batch':
+                norm = layers.BatchNorm1d
+            bayesian_params = None
+
+        for i in range(1, dense_params['num_layers'] + 1):
+            input_size = output_size = dense_params['hidden_size']
+            if i == 1:
+                input_size = params['d_model']
+            if i == dense_params['num_layers']:
+                output_size = dense_params['output_features']
+
+            for layer_type in dense_params['ordering']:
+                if layer_type == 'norm' and norm is not None and i > 1:
+                    dense_net[f'norm_{i}'] = norm(input_size, hyperparams=bayesian_params)
+                elif layer_type == 'nonlin' and i > 1:
+                    dense_net[f'nonlin_{i}'] = Nonlinearity(dense_params['nonlinearity'])
+                elif layer_type == 'dropout' and i > 1:
+                    dense_net[f'dropout_{i}'] = nn.Dropout(dense_params['dropout_p'])
+                elif layer_type == 'linear':
+                    dense_net[f'linear_{i}'] = linear(input_size, output_size, hyperparams=bayesian_params)
+        self.dense_net_modules = dense_net
+        self.dense_net = nn.Sequential(dense_net)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for m in self.modules():
+            if hasattr(m, 'reset_parameters') and m is not self:
+                m.reset_parameters()
+        # This was important from their code. Initialize parameters with Glorot or fan_avg.
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def weight_costs(self):
+        return (
+            self.encoder.weight_costs() +
+            [cost
+             for name, module in self.dense_net_modules.items()
+             if name.startswith('linear') or name.startswith('norm')
+             for cost in module.weight_costs()]
+        )
+
+    def forward(self, inputs, input_masks):
+        """
+        :param inputs: tensor(batch, src_length, in_channels)
+        :param input_masks: tensor(batch, src_length, 1)
+        :return:
+        """
+        if input_masks is None:
+            input_masks = make_1d_mask(inputs)
+        x = inputs * input_masks
+
+        # out_states: (batch, seq_len, d_model)
+        out_states = self.encoder(self.src_embed(x), input_masks)
+
+        # hiddens: (batch, d_model)
+        params = self.hyperparams['transformer']
+        if params['use_output'] == 'global_max':
+            hiddens = (out_states * input_masks).max(1)[0]
+        else:
+            # average over masked output states
+            hiddens = (out_states * input_masks).sum(1) / input_masks.sum(1)
+
+        # features_logits: (batch, output_features)
+        features_logits = self.dense_net(hiddens)
+        return features_logits
+
+    def calculate_loss(self, logits, targets, n_eff=1., pos_weight=None, reduction='mean'):
+        reg_params = self.hyperparams['regularization']
+        ce_loss = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight, reduction=reduction)
+        loss = ce_loss
+
+        # regularization
+        if reg_params['bayesian']:
+            loss += self.weight_cost().mul(reg_params['bayesian_lambda'] / n_eff)
+        elif reg_params['l2']:
+            # # Skip; using built-in optimizer weight_decay instead
+            # loss += self.weight_cost() * reg_params['l2_lambda'] / n_eff
+            pass
+
+        return {
+            'loss': loss,
+            'ce_loss': ce_loss
+        }

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 import torch.distributions as dist
 
-from functions import anneal, rsample, kl_normal, mle_mixture_gaussians
+from functions import anneal, rsample, kl_normal, mle_mixture_gaussians, normalize
 
 
 class HyperparameterError(ValueError):
@@ -20,7 +20,7 @@ class GaussianWeightUncertainty(object):
     def __init__(self, name, hyperparams):
         self.name = name
         self.rho_type = hyperparams['rho_type']  # lin_sigma, log_sigma
-        self.prior_type = hyperparams['prior_type']  # gaussian, scale_mix_gaussian
+        self.prior_type = hyperparams['prior_type']  # gaussian, scale_mix_gaussian, laplacian
         self.prior_params = hyperparams['prior_params']
 
     def rho_to_sigma(self, rho):
@@ -41,14 +41,20 @@ class GaussianWeightUncertainty(object):
         sigma = self.rho_to_sigma(getattr(module, self.name + '_rho'))
         if self.prior_type == 'gaussian':
             return kl_normal(mu, sigma, *self.prior_params)
-        elif self.prior_type == 'scale_mix_gaussian':
+        elif self.prior_type in ['scale_mix_gaussian', 'laplacian']:
             # No analytical solution for KL divergence,
             # so use current sample from variational posterior instead.
             if module.training:
                 weight = getattr(module, self.name)
             else:
                 weight = mu
-            log_prior = mle_mixture_gaussians(weight, *self.prior_params)
+
+            log_prior = None
+            if self.prior_type == 'scale_mix_gaussian':
+                log_prior = mle_mixture_gaussians(weight, *self.prior_params)
+            elif self.prior_type == 'laplacian':
+                log_prior = dist.Laplace(*self.prior_params).log_prob(weight)
+
             log_variational_posterior = dist.Normal(mu, sigma).log_prob(weight)
             return log_variational_posterior - log_prior
 
@@ -58,7 +64,6 @@ class GaussianWeightUncertainty(object):
     def apply(self, module):
         weight = getattr(module, self.name)
         del module._parameters[self.name]  # remove w from parameter list
-
         module.register_parameter(self.name + '_mu', Parameter(weight.data))
         module.register_parameter(self.name + '_rho', Parameter(-7 * torch.ones_like(weight).data))
         object.__setattr__(module, self.name, self.sample_weight(module))
@@ -116,7 +121,10 @@ class BatchNorm1d(nn.BatchNorm1d):
         nn.BatchNorm1d.__init__(self, *args, **kwargs)
 
     def weight_costs(self):
-        return [self.weight.pow(2).sum(), self.bias.pow(2).sum()]
+        if self.affine:
+            return [self.weight.pow(2).sum(), self.bias.pow(2).sum()]
+        else:
+            return []
 
     def forward(self, x, step=0):
         return nn.BatchNorm1d.forward(self, x)
@@ -143,6 +151,72 @@ class BayesianBatchNorm1d(nn.BatchNorm1d):
             regularizer(self, stddev=stddev)
 
         output = nn.BatchNorm1d.forward(self, x)
+        return output
+
+
+class LayerNorm(nn.Module):
+    """Normalizes across dimension `dim`.
+    """
+    __constants__ = ['num_channels', 'dim', 'eps', 'affine', 'weight', 'bias', 'g_init', 'bias_init']
+
+    def __init__(self, num_channels, dim=2, eps=1e-6, affine=True, g_init=1.0, bias_init=0.0, **_):
+        super(LayerNorm, self).__init__()
+        self.num_channels = num_channels
+        self.dim = dim
+        self.eps = eps
+        self.affine = affine
+        self.g_init = g_init
+        self.bias_init = bias_init
+        if self.affine:
+            self.weight = Parameter(torch.Tensor(num_channels))
+            self.bias = Parameter(torch.Tensor(num_channels))
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if self.affine:
+            nn.init.normal_(self.weight, mean=self.g_init, std=1e-6)
+            nn.init.normal_(self.bias, mean=self.bias_init, std=1e-6)
+
+    def weight_costs(self):
+        if self.affine:
+            return [self.weight.pow(2).sum(), self.bias.pow(2).sum()]
+        else:
+            return []
+
+    def forward(self, x, step=0):
+        h = normalize(x, self.dim)
+
+        if self.affine:
+            shape = [1 for _ in x.shape]
+            shape[self.dim] = self.num_channels
+            h = self.weight.view(shape) * h + self.bias.view(shape)
+        return h
+
+
+class BayesianLayerNorm(LayerNorm):
+    def __init__(self, *args, **kwargs):
+        self.hyperparams = kwargs.pop('hyperparams')
+        LayerNorm.__init__(self, *args, **kwargs)
+
+        self.regularizers = {}
+        names = [name for name, _ in self.named_parameters()]
+        for name in names:
+            regularizer = GaussianWeightUncertainty(name, self.hyperparams['regularization'])
+            regularizer.apply(self)
+            self.regularizers[name] = regularizer
+
+    def weight_costs(self):
+        return [regularizer.weight_cost(self) for regularizer in self.regularizers.values()]
+
+    def forward(self, x, step=0):
+        stddev = anneal(step, self.hyperparams['sampler_hyperparams'])
+        for regularizer in self.regularizers.values():
+            regularizer(self, stddev=stddev)
+
+        output = LayerNorm.forward(self, x, step=step)
         return output
 
 

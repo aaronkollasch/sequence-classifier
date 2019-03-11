@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -65,6 +66,61 @@ def comb_losses(losses_f, losses_r):
             losses_comb[key + '_f'] = losses_f[key]
             losses_comb[key + '_r'] = losses_r[key]
     return losses_comb
+
+
+def subsequent_mask(size):
+    """Mask out subsequent positions."""
+    attn_shape = (1, size, size)
+    mask = np.tril(np.ones(attn_shape), k=0).astype('uint8')
+    return torch.as_tensor(mask)  # TODO handle more shapes than NLC
+
+
+def random_subsequent_mask(size):
+    """Mask out randomly ordered subsequent positions."""
+    attn_shape = (1, size, size)
+    mask = np.tril(np.ones(attn_shape), k=0).astype('uint8')
+    order = np.arange(size)
+    np.random.shuffle(order)
+    mask = mask[:, :, order][:, order]
+    # mask = np.ascontiguousarray(mask)  # not necessary, mask is already contiguous
+    return torch.as_tensor(mask)
+
+
+def diagonal_mask(size):
+    """Mask out diagonal positions."""
+    return torch.diag(torch.ones(size)).unsqueeze(0) == 0  # TODO handle more shapes than NLC
+
+
+def make_std_mask(src, tgt, l_dim=1, c_dim=2):
+    src_mask = tgt_mask = None
+    if src is not None:
+        src_mask = (src.sum(c_dim) != 0).unsqueeze(l_dim)
+    if tgt is not None:
+        tgt_mask = (tgt.sum(c_dim) != 0).unsqueeze(l_dim)
+        tgt_mask = tgt_mask & subsequent_mask(tgt.size(l_dim)).type_as(tgt_mask.data)
+    return src_mask, tgt_mask
+
+
+def make_1d_mask(src, l_dim=1, c_dim=2):
+    if src is not None:
+        return (src.sum(c_dim) != 0).unsqueeze(l_dim)
+
+
+def make_2d_mask(tgt, random_order=False, l_dim=1, c_dim=2):
+    if tgt is not None:
+        tgt_mask = (tgt.sum(c_dim) != 0).unsqueeze(l_dim)
+        if random_order:
+            tgt_mask = tgt_mask & random_subsequent_mask(tgt.size(l_dim)).type_as(tgt_mask.data)
+        else:
+            tgt_mask = tgt_mask & subsequent_mask(tgt.size(l_dim)).type_as(tgt_mask.data)
+        return tgt_mask
+
+
+def make_1d_to_2d_mask(mask, mask_diag=True, l_dim=1, c_dim=2):
+    if mask_diag:
+        return mask & mask.transpose(l_dim, c_dim) & diagonal_mask(mask.size(l_dim)).type_as(mask.data)
+    else:
+        return mask & mask.transpose(l_dim, c_dim)
 
 
 def clamp(x, min_val=0., max_val=1.):

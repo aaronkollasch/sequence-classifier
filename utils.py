@@ -5,9 +5,16 @@ import glob
 import collections
 import shutil
 import contextlib
+import copy
 
 import numpy as np
 import torch
+import torch.nn as nn
+
+
+def clones(module, n):
+    """Produce n identical layers."""
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(n)])
 
 
 def recursive_update(orig_dict, update_dict):
