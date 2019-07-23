@@ -43,8 +43,8 @@ parser.add_argument("--test-datasets", type=str, default=[], nargs='*',
                     help="Datasets names in \"dataset\" column to use for testing.")
 parser.add_argument("--train-val-split", type=float, default=0.9,
                     help="Proportion of training data to use for training.")
-parser.add_argument("--include-vh", action='store_true',
-                    help="Include an encoding of the VH gene in the input.")
+parser.add_argument("--include-inputs", nargs='*', default=('seq', 'vh'),
+                    help="Data to include in the input. (seq, vh, vl)")
 parser.add_argument("--num-data-workers", metavar='N', type=int, default=4,
                     help="Number of workers to load data")
 parser.add_argument("--restore", type=str, default=None,
@@ -140,7 +140,7 @@ def get_dataset(step=0):
             dataset=args.dataset,
             matching=True,
             unlimited_epoch=True,
-            include_vh=args.include_vh,
+            include_inputs=args.include_inputs,
             output_shape='NLC',
             output_types='decoder',
         )
@@ -161,8 +161,7 @@ def get_dataset(step=0):
             comparisons=(('Aff1', 'PSR1', 2., 2.),),
             matching=True,
             unlimited_epoch=True,
-            include_vl=False,
-            include_vh=args.include_vh,
+            include_inputs=args.include_inputs,
             output_shape='NLC',
             output_types='decoder',
         )

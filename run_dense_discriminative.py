@@ -42,10 +42,8 @@ parser.add_argument("--comparison-thresh", type=float, default=2.,
                     help="Minimum counts to include in comparison.")
 parser.add_argument("--train-val-split", type=float, default=0.9,
                     help="Proportion of training data to use for training.")
-parser.add_argument("--include-vl", action='store_true',
-                    help="Include an encoding of the VL gene in the input.")
-parser.add_argument("--include-vh", action='store_true',
-                    help="Include an encoding of the VH gene in the input.")
+parser.add_argument("--include-inputs", nargs='*', default=('seq', 'vh', 'vl'),
+                    help="Data to include in the input. (seq, vh, vl)")
 parser.add_argument("--max-k", type=int, default=3,
                     help="Maximum k-mer size.")
 parser.add_argument("--include-length", action='store_true',
@@ -160,8 +158,7 @@ dataset = data_loaders.IPIMultiDataset(
     train_val_split=args.train_val_split,
     matching=True,
     unlimited_epoch=True,
-    include_vl=args.include_vl,
-    include_vh=args.include_vh,
+    include_inputs=args.include_inputs,
     comparisons=(
         (
             args.comparison.split('-')[0],

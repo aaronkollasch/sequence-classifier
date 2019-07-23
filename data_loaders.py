@@ -695,8 +695,7 @@ class AntibodySequenceDataset(SequenceDataset):
             output_shape='NLC',
             output_types='encoder',
             kmer_params=None,
-            include_vl=False,
-            include_vh=False,
+            include_inputs=('seq', 'vh', 'vl'),
     ):
         SequenceDataset.__init__(
             self,
@@ -710,8 +709,7 @@ class AntibodySequenceDataset(SequenceDataset):
             kmer_params=kmer_params,
         )
         self.working_dir = working_dir
-        self.include_vl = include_vl
-        self.include_vh = include_vh
+        self.include_inputs = include_inputs
 
         self.vl_list = self.IPI_VL_SEQS.copy()
         self.vh_list = self.IPI_VH_SEQS.copy()
@@ -738,20 +736,19 @@ class AntibodySequenceDataset(SequenceDataset):
                 input_dim += 1
         else:
             input_dim = len(self.alphabet)
-        if self.include_vl:
-            input_dim += len(self.light_to_idx)
-        if self.include_vh:
+        if 'vh' in self.include_inputs:
             input_dim += len(self.heavy_to_idx)
+        if 'vl' in self.include_inputs:
+            input_dim += len(self.light_to_idx)
         return input_dim
 
     @property
     def params(self):
         params = super(AntibodySequenceDataset, self).params
         params.update({
-            "include_vl": self.include_vl,
-            "include_vh": self.include_vh,
-            "vl_seqs": self.vl_list,
+            "include_inputs": self.include_inputs,
             "vh_seqs": self.vh_list,
+            "vl_seqs": self.vl_list,
         })
         return params
 
@@ -760,14 +757,12 @@ class AntibodySequenceDataset(SequenceDataset):
         if 'for_decoder' in d:
             d['output_types'] = 'decoder' if d['for_decoder'] else 'encoder'
         SequenceDataset.params.__set__(self, d)
-        if 'include_vl' in d:
-            self.include_vl = d['include_vl']
-        if 'include_vh' in d:
-            self.include_vh = d['include_vh']
-        if 'vl_seqs' in d:
-            self.vl_list = d['vl_seqs']
+        if 'include_inputs' in d:
+            self.include_inputs = d['include_inputs']
         if 'vh_seqs' in d:
             self.vh_list = d['vh_seqs']
+        if 'vl_seqs' in d:
+            self.vl_list = d['vl_seqs']
 
     def sequences_to_onehot(self, sequences, vls=None, vhs=None, reverse=None, matching=None):
         reverse = self.reverse if reverse is None else reverse
@@ -780,34 +775,33 @@ class AntibodySequenceDataset(SequenceDataset):
             if sequences[i][-1] == 'W':
                 sequences[i] = sequences[i][:-1]
 
-        if 'decoder' in self.output_types:
-            seq_arr, seq_output_arr, seq_mask, _, _ = sequences_to_decoder_onehot(
-                sequences, self.aa_dict, self.output_aa_dict, reverse=reverse, matching=False
-            )
-        elif 'kmer_vector' in self.output_types:
-            kmer_arr = sequences_to_kmer_vector(sequences, self.kmer_to_idx, **self.kmer_params)
-            seq_arr = kmer_arr.reshape((num_seqs, -1, 1, 1))
-            seq_mask = seq_output_arr = None
+        if 'seq' in self.include_inputs:
+            if 'decoder' in self.output_types:
+                seq_arr, seq_output_arr, seq_mask, _, _ = sequences_to_decoder_onehot(
+                    sequences, self.aa_dict, self.output_aa_dict, reverse=reverse, matching=False
+                )
+            elif 'kmer_vector' in self.output_types:
+                kmer_arr = sequences_to_kmer_vector(sequences, self.kmer_to_idx, **self.kmer_params)
+                seq_arr = kmer_arr.reshape((num_seqs, -1, 1, 1))
+                seq_mask = seq_output_arr = None
+            else:
+                seq_arr, seq_mask = sequences_to_encoder_onehot(sequences, self.aa_dict)
+                seq_output_arr = None
         else:
-            seq_arr, seq_mask = sequences_to_encoder_onehot(sequences, self.aa_dict)
-            seq_output_arr = None
+            seq_arr = seq_mask = seq_output_arr = None
 
         light_arr = heavy_arr = None
-        if self.include_vl:
-            light_arr = np.zeros((num_seqs, len(self.light_to_idx), 1, seq_arr.shape[-1]))
-        if self.include_vh:
+        if 'vh' in self.include_inputs:
             heavy_arr = np.zeros((num_seqs, len(self.heavy_to_idx), 1, seq_arr.shape[-1]))
-
-        for i in range(num_seqs):
-            if self.include_vl:
-                light_arr[i, self.light_to_idx[vls[i]], 0, :] = 1.
-            if self.include_vl:
+            for i in range(num_seqs):
                 heavy_arr[i, self.heavy_to_idx[vhs[i]], 0, :] = 1.
+        if 'vl' in self.include_inputs:
+            light_arr = np.zeros((num_seqs, len(self.light_to_idx), 1, seq_arr.shape[-1]))
+            for i in range(num_seqs):
+                light_arr[i, self.light_to_idx[vls[i]], 0, :] = 1.
 
-        if self.include_vl:
-            seq_arr = np.concatenate((seq_arr, light_arr), axis=1)
-        if self.include_vh:
-            seq_arr = np.concatenate((seq_arr, heavy_arr), axis=1)
+        seq_arrs = [{'seq': seq_arr, 'vh': heavy_arr, 'vl': light_arr}[name] for name in self.include_inputs]
+        seq_arr = np.concatenate(seq_arrs, axis=1)
 
         output = {'input': seq_arr, 'mask': seq_mask, 'decoder_output': seq_output_arr}
         for key in output.keys():
@@ -845,8 +839,7 @@ class IPIFastaDataset(AntibodySequenceDataset):
             output_shape='NLC',
             output_types='encoder',
             kmer_params=None,
-            include_vl=False,
-            include_vh=False,
+            include_inputs=('seq', 'vh', 'vl'),
     ):
         AntibodySequenceDataset.__init__(
             self,
@@ -858,8 +851,7 @@ class IPIFastaDataset(AntibodySequenceDataset):
             output_shape=output_shape,
             output_types=output_types,
             kmer_params=kmer_params,
-            include_vl=include_vl,
-            include_vh=include_vh,
+            include_inputs=include_inputs,
         )
         self.dataset = dataset
         self.working_dir = working_dir
@@ -958,8 +950,7 @@ class IPISingleClusteredSequenceDataset(AntibodySequenceDataset):
             output_shape='NLC',
             output_types='encoder',
             kmer_params=None,
-            include_vl=False,
-            include_vh=False,
+            include_inputs=('seq', 'vh', 'vl'),
     ):
         AntibodySequenceDataset.__init__(
             self,
@@ -971,8 +962,7 @@ class IPISingleClusteredSequenceDataset(AntibodySequenceDataset):
             output_shape=output_shape,
             output_types=output_types,
             kmer_params=kmer_params,
-            include_vl=include_vl,
-            include_vh=include_vh,
+            include_inputs=include_inputs,
         )
         self.dataset = dataset
         self.working_dir = working_dir
@@ -1078,8 +1068,7 @@ class IPITwoClassSingleClusteredSequenceDataset(AntibodySequenceDataset, TrainVa
             classes=('HighPSRAll', 'LowPSRAll'),
             train_val_split=1.0,
             split_seed=42,
-            include_vl=False,
-            include_vh=False,
+            include_inputs=('seq', 'vh', 'vl'),
     ):
         AntibodySequenceDataset.__init__(
             self,
@@ -1091,8 +1080,7 @@ class IPITwoClassSingleClusteredSequenceDataset(AntibodySequenceDataset, TrainVa
             output_shape=output_shape,
             output_types=output_types,
             kmer_params=kmer_params,
-            include_vl=include_vl,
-            include_vh=include_vh,
+            include_inputs=include_inputs,
         )
         TrainValTestDataset.__init__(self)
         self.dataset = dataset
@@ -1281,8 +1269,7 @@ class IPISingleDataset(AntibodySequenceDataset, TrainValTestDataset):
             comparisons=(('Aff1', 'PSR1', 0., 0.),),  # before, after, thresh_before, thresh_after
             train_val_split=1.0,
             split_seed=42,
-            include_vl=False,
-            include_vh=False,
+            include_inputs=('seq', 'vh', 'vl'),
     ):
         AntibodySequenceDataset.__init__(
             self,
@@ -1294,8 +1281,7 @@ class IPISingleDataset(AntibodySequenceDataset, TrainValTestDataset):
             output_shape=output_shape,
             output_types=output_types,
             kmer_params=kmer_params,
-            include_vl=include_vl,
-            include_vh=include_vh,
+            include_inputs=include_inputs,
         )
         TrainValTestDataset.__init__(self)
         self.dataset = dataset
@@ -1442,8 +1428,7 @@ class IPIMultiDataset(AntibodySequenceDataset, TrainValTestDataset):
             comparisons=(('Aff1', 'PSR1', 0., 0.),),  # before, after, thresh_before, thresh_after
             train_val_split=1.0,
             split_seed=42,
-            include_vl=False,
-            include_vh=False,
+            include_inputs=('seq', 'vh', 'vl'),
     ):
         AntibodySequenceDataset.__init__(
             self,
@@ -1455,8 +1440,7 @@ class IPIMultiDataset(AntibodySequenceDataset, TrainValTestDataset):
             output_shape=output_shape,
             output_types=output_types,
             kmer_params=kmer_params,
-            include_vl=include_vl,
-            include_vh=include_vh,
+            include_inputs=include_inputs,
         )
         TrainValTestDataset.__init__(self)
         self.dataset = dataset
@@ -1465,8 +1449,6 @@ class IPIMultiDataset(AntibodySequenceDataset, TrainValTestDataset):
         self.comparisons = comparisons
         self.train_val_split = train_val_split
         self.split_seed = split_seed
-        self.include_vl = include_vl
-        self.include_vh = include_vh
 
         self.cdr_to_output = {}
         self.cdr_to_heavy = {}
@@ -1614,7 +1596,7 @@ class VHAntibodyDataset(AntibodySequenceDataset):
             output_shape='NLC',
             output_types='encoder',
             kmer_params=None,
-            include_vh=False,
+            include_inputs=('seq', 'vh'),
             vh_set_name='IPI',
     ):
         super(VHAntibodyDataset, self).__init__(
@@ -1626,8 +1608,7 @@ class VHAntibodyDataset(AntibodySequenceDataset):
             output_shape=output_shape,
             output_types=output_types,
             kmer_params=kmer_params,
-            include_vl=False,
-            include_vh=include_vh,
+            include_inputs=include_inputs,
         )
         self.vh_set_name = vh_set_name
 
@@ -1640,7 +1621,7 @@ class VHAntibodyDataset(AntibodySequenceDataset):
     @property
     def input_dim(self):
         input_dim = len(self.alphabet)
-        if self.include_vh:
+        if 'vh' in self.include_inputs:
             input_dim += len(self.heavy_to_idx)
         return input_dim
 
@@ -1695,7 +1676,7 @@ class VHAntibodyFastaDataset(VHAntibodyDataset):
             output_shape='NLC',
             output_types='decoder',
             kmer_params=None,
-            include_vh=False,
+            include_inputs=('seq', 'vh'),
             vh_set_name='IPI',
     ):
         super(VHAntibodyFastaDataset, self).__init__(
@@ -1707,7 +1688,7 @@ class VHAntibodyFastaDataset(VHAntibodyDataset):
             output_shape=output_shape,
             output_types=output_types,
             kmer_params=kmer_params,
-            include_vh=include_vh,
+            include_inputs=include_inputs,
             vh_set_name=vh_set_name,
         )
         self.dataset = dataset
@@ -1788,7 +1769,7 @@ class VHClusteredAntibodyDataset(VHAntibodyDataset):
             output_shape='NLC',
             output_types='decoder',
             kmer_params=None,
-            include_vh=False,
+            include_inputs=('seq', 'vh'),
             vh_set_name='IPI',
     ):
         super(VHClusteredAntibodyDataset, self).__init__(
@@ -1800,7 +1781,7 @@ class VHClusteredAntibodyDataset(VHAntibodyDataset):
             output_shape=output_shape,
             output_types=output_types,
             kmer_params=kmer_params,
-            include_vh=include_vh,
+            include_inputs=include_inputs,
             vh_set_name=vh_set_name,
         )
         self.dataset = dataset
