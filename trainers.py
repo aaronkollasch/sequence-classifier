@@ -133,7 +133,8 @@ class ClassifierTrainer:
 
             self.optimizer.step()
 
-            if step % self.params['snapshot_interval'] == 0:
+            if step in [1000, 2500, 5000, 10000, 25000, 50000, 100000, 250000, 500000, 1000000, 2500000] or \
+                    step % self.params['snapshot_interval'] == 0:
                 if self.params['snapshot_path'] is not None:
                     self.save_state()
 
@@ -142,18 +143,22 @@ class ClassifierTrainer:
             #     step, time.time()-start, data_load_time, loss.detach(), accuracy.detach()), flush=True)
 
     def validate(self, r_seed=42):
-        if len(self.loader.dataset.cdr_seqs_val) == 0:
+        self.loader.dataset.val()
+        try:
+            n_eff = self.loader.dataset.n_eff
+        except ValueError:
+            n_eff = 0
+        if n_eff == 0:
+            self.loader.dataset.train()
             return None
 
         self.model.eval()
-        self.loader.dataset.val()
         self.loader.dataset.unlimited_epoch = False
         prev_state = enter_local_rng_state(r_seed)
 
         with torch.no_grad():
             loader = GeneratorDataLoader(self.loader.dataset, num_workers=self.loader.num_workers)
             pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
-            n_eff = len(self.loader.dataset.cdr_seqs_train)
 
             true_outputs = []
             logits = []
@@ -195,16 +200,23 @@ class ClassifierTrainer:
         return losses, accuracies, true_outputs, logits, roc_scores
 
     def test(self, model_eval=True, num_samples=1, r_seed=42):
-        if model_eval:
-            self.model.eval()
         if isinstance(self.loader.dataset, TrainValTestDataset):
             self.loader.dataset.test()
-        self.loader.dataset.unlimited_epoch = False
-        prev_state = enter_local_rng_state(r_seed)
 
+        try:
+            n_eff = self.loader.dataset.n_eff
+        except ValueError:
+            n_eff = 0
+        if n_eff == 0:
+            self.loader.dataset.train()
+            return None
+
+        if model_eval:
+            self.model.eval()
+        prev_state = enter_local_rng_state(r_seed)
+        self.loader.dataset.unlimited_epoch = False
         loader = GeneratorDataLoader(self.loader.dataset, num_workers=self.loader.num_workers)
         pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
-        n_eff = len(self.loader.dataset.cdr_seqs_train)
 
         true_outputs = []
         sequences = []
@@ -262,8 +274,6 @@ class ClassifierTrainer:
         revive_exec = f"{self.params['snapshot_path']}/revive_executable/{self.params['snapshot_name']}.sh"
         if not os.path.exists(os.path.dirname(snapshot)):
             os.makedirs(os.path.dirname(snapshot), exist_ok=True)
-        if not os.path.exists(os.path.dirname(revive_exec)):
-            os.makedirs(os.path.dirname(revive_exec), exist_ok=True)
         torch.save(
             {
                 'step': self.model.step,
@@ -278,11 +288,14 @@ class ClassifierTrainer:
             },
             snapshot
         )
-        with open(revive_exec, "w") as f:
-            snapshot_exec = self.params['snapshot_exec_template'].format(
-                restore=os.path.abspath(snapshot)
-            )
-            f.write(snapshot_exec)
+        if 'snapshot_exec_template' in self.params:
+            if not os.path.exists(os.path.dirname(revive_exec)):
+                os.makedirs(os.path.dirname(revive_exec), exist_ok=True)
+            with open(revive_exec, "w") as f:
+                snapshot_exec = self.params['snapshot_exec_template'].format(
+                    restore=os.path.abspath(snapshot)
+                )
+                f.write(snapshot_exec)
 
     def load_state(self, checkpoint, map_location=None):
         if not isinstance(checkpoint, dict):
@@ -558,8 +571,6 @@ class GenerativeClassifierTrainer:
         revive_exec = f"{self.params['snapshot_path']}/revive_executable/{self.params['snapshot_name']}.sh"
         if not os.path.exists(os.path.dirname(snapshot)):
             os.makedirs(os.path.dirname(snapshot), exist_ok=True)
-        if not os.path.exists(os.path.dirname(revive_exec)):
-            os.makedirs(os.path.dirname(revive_exec), exist_ok=True)
         torch.save(
             {
                 'step': self.model.step,
@@ -574,11 +585,14 @@ class GenerativeClassifierTrainer:
             },
             snapshot
         )
-        with open(revive_exec, "w") as f:
-            snapshot_exec = self.params['snapshot_exec_template'].format(
-                restore=os.path.abspath(snapshot)
-            )
-            f.write(snapshot_exec)
+        if 'snapshot_exec_template' in self.params:
+            if not os.path.exists(os.path.dirname(revive_exec)):
+                os.makedirs(os.path.dirname(revive_exec), exist_ok=True)
+            with open(revive_exec, "w") as f:
+                snapshot_exec = self.params['snapshot_exec_template'].format(
+                    restore=os.path.abspath(snapshot)
+                )
+                f.write(snapshot_exec)
 
     def load_state(self, checkpoint, map_location=None):
         if not isinstance(checkpoint, dict):

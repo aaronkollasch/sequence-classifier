@@ -19,9 +19,9 @@ working_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
 data_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
 
 
-##################
-# LOAD ARGUMENTS #
-##################
+###################
+# PARSE ARGUMENTS #
+###################
 
 parser = argparse.ArgumentParser(description="Train a dense discriminative classifier model.")
 parser.add_argument("--hidden-size", type=int, default=50,
@@ -110,7 +110,7 @@ srun stdbuf -oL -eL {sys.executable} \\
 
 if args.restore is not None:
     # prevent from repeating batches/seed when restoring at intermediate point
-    # script is repeatable as long as restored at same point with same restore string
+    # script is repeatable as long as restored at same point with same restore string and same num_workers
     args.r_seed += int(hashlib.sha1(args.restore.encode()).hexdigest(), 16)
     args.r_seed = args.r_seed % (2 ** 32 - 1)  # limit of np.random.seed
 

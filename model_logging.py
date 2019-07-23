@@ -9,6 +9,29 @@ from PIL import Image
 import torch
 
 
+class Accumulator:
+    def __init__(self, *keys):
+        self._values = {key: 0. for key in keys}
+        self.log_interval = 0
+
+    def accumulate(self, **kwargs):
+        for key in kwargs:
+            self._values[key] += kwargs[key]
+        self.log_interval += 1
+
+    def reset(self):
+        for key in self._values:
+            self._values[key] = 0.
+        self.log_interval = 0
+
+    @property
+    def values(self):
+        return {key: value / self.log_interval for key, value in self._values.items()}
+
+    def __getattr__(self, item):
+        return self._values[item] / self.log_interval
+
+
 class Logger:
     def __init__(self,
                  log_interval=50,
@@ -23,26 +46,26 @@ class Logger:
         self.gen_interval = generate_interval
         self.test_interval = test_interval
         self.log_time = time.time()
-        self.accumulated_loss = 0
-        self.accumulated_accuracy = 0
-        self.accumulated_bitperchar = 0
+        self.load_time = 0.
+        self.accumulator = Accumulator('loss', 'accuracy', 'bitperchar')
         self.generate_function = generate_function
         if self.generate_function is not None:
             self.generate_thread = threading.Thread(target=self.generate_function)
             self.generate_function.daemon = True
 
-    def log(self, current_step, current_losses, current_grad_norm):
-        self.accumulated_loss += float(current_losses['loss'].detach())
-        if 'accuracy' in current_losses:
-            self.accumulated_accuracy += float(current_losses['accuracy'].detach())
-        if 'bitperchar' in current_losses:
-            self.accumulated_bitperchar += float(current_losses['bitperchar'].detach())
+    def log(self, current_step, current_losses, current_grad_norm, load_time=0.):
+        self.load_time += load_time
+        self.accumulator.accumulate(
+            loss=float(current_losses['loss'].detach()),
+            accuracy=float(current_losses['accuracy'].detach()) if 'accuracy' in current_losses else 0.,
+            bitperchar=float(current_losses['bitperchar'].detach()) if 'bitperchar' in current_losses else 0.,
+        )
+
         if current_step % self.log_interval == 0:
             self.log_loss(current_step)
             self.log_time = time.time()
-            self.accumulated_loss = 0
-            self.accumulated_accuracy = 0
-            self.accumulated_bitperchar = 0
+            self.load_time = 0.
+            self.accumulator.reset()
         if self.val_interval is not None and self.val_interval > 0 and current_step % self.val_interval == 0:
             self.validate(current_step)
         if self.gen_interval is not None and self.gen_interval > 0 and current_step % self.gen_interval == 0:
@@ -51,11 +74,10 @@ class Logger:
             self.test(current_step)
 
     def log_loss(self, current_step):
-        avg_loss = self.accumulated_loss / self.log_interval
-        avg_acc = self.accumulated_accuracy / self.log_interval
-        avg_bitperchar = self.accumulated_bitperchar / self.log_interval
-        print(f"{time.time()-self.log_time:6.3f} loss, bitperchar, accuracy at step {current_step: 8d}: "
-              f"{avg_loss:10.6f}, {avg_bitperchar:10.6f}, {avg_acc:10.6f}", flush=True)
+        v = self.accumulator.values
+        print(f"{time.time()-self.log_time:6.3f} {self.load_time:6.3f} "
+              f"loss, bitperchar, accuracy at step {current_step: 8d}: "
+              f"{v['loss']:10.6f}, {v['bitperchar']:10.6f}, {v['accuracy']:10.6f}", flush=True)
 
     def validate(self, current_step):
         validation = self.trainer.validate()
@@ -112,8 +134,8 @@ class TensorboardLogger(Logger):
         self.log_image_summaries = log_image_summaries
         self.print_output = print_output
 
-    def log(self, current_step, current_losses, current_grad_norm):
-        super(TensorboardLogger, self).log(current_step, current_losses, current_grad_norm)
+    def log(self, current_step, current_losses, current_grad_norm, load_time=0.):
+        super(TensorboardLogger, self).log(current_step, current_losses, current_grad_norm, load_time)
         self.scalar_summary('grad norm', current_grad_norm, current_step)
         self.scalar_summary('loss', current_losses['loss'].detach(), current_step)
         if 'accuracy' in current_losses:
@@ -125,7 +147,7 @@ class TensorboardLogger(Logger):
         if self.print_output:
             Logger.log_loss(self, current_step)
         # loss
-        avg_loss = self.accumulated_loss / self.log_interval
+        avg_loss = self.accumulator.loss
         self.scalar_summary('avg loss', avg_loss, current_step)
 
         if self.log_param_histograms:

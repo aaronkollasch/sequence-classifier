@@ -82,7 +82,7 @@ def random_subsequent_mask(size):
     order = np.arange(size)
     np.random.shuffle(order)
     mask = mask[:, :, order][:, order]
-    # mask = np.ascontiguousarray(mask)  # not necessary, mask is already contiguous
+    mask = np.ascontiguousarray(mask)  # mask should already be contiguous, but statement copies only if necessary.
     return torch.as_tensor(mask)
 
 
@@ -152,6 +152,7 @@ def moments(x, dim, keepdim=False):
 
 class Normalize(autograd.Function):
     """Normalize x across dim
+    dim may be a single dimension or multiple dimensions
     """
     @staticmethod
     def forward(ctx, x, dim, eps=1e-5):

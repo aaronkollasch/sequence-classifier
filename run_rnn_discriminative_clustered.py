@@ -18,23 +18,14 @@ from utils import get_cuda_version, get_cudnn_version
 working_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
 data_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
 
-
-###################
-# PARSE ARGUMENTS #
-###################
-
-parser = argparse.ArgumentParser(description="Train an discriminative transformer classifier model.")
-parser.add_argument("--d-model", metavar='D', type=int, default=64,
-                    help="Number of channels in attention head.")
-parser.add_argument("--d-ff", metavar='D', type=int, default=128,
-                    help="Number of channels in attention head.")
-parser.add_argument("--num-heads", type=int, default=2,
-                    help="Number of attention heads.")
-parser.add_argument("--num-layers", type=int, default=4,
-                    help="Number of layers.")
+parser = argparse.ArgumentParser(description="Train an discriminative RNN classifier model.")
+parser.add_argument("--hidden-size", type=int, default=100,
+                    help="Number of channels in the RNN hidden state.")
+parser.add_argument("--num-layers", type=int, default=2,
+                    help="Number of RNN layers.")
 parser.add_argument("--hidden-size-dense", type=int, default=50,
                     help="Number of channels in the dense hidden state.")
-parser.add_argument("--num-layers-dense", type=int, default=1,
+parser.add_argument("--num-layers-dense", type=int, default=2,
                     help="Number of dense layers.")
 parser.add_argument("--num-iterations", type=int, default=250005,
                     help="Number of iterations to run the model.")
@@ -42,12 +33,8 @@ parser.add_argument("--batch-size", type=int, default=32,
                     help="Batch size.")
 parser.add_argument("--dataset", type=str, default=None,
                     help="Dataset name for fitting model.")
-parser.add_argument("--test-datasets", type=str, default=[], nargs='*',
-                    help="Datasets names in \"dataset\" column to use for testing.")
-parser.add_argument("--comparison", type=str, default="Aff1-PSR1",
-                    help="Comparison to test against.")
-parser.add_argument("--comparison-thresh", type=float, default=2.,
-                    help="Minimum counts to include in comparison.")
+parser.add_argument("--classes", type=str, nargs=2, default=["HighPSRAll", "LowPSRAll"],
+                    help="Classes to compare (negative, positive).")
 parser.add_argument("--train-val-split", type=float, default=0.9,
                     help="Proportion of training data to use for training.")
 parser.add_argument("--include-vl", action='store_true',
@@ -62,7 +49,7 @@ parser.add_argument("--run-name", type=str, default=None,
                     help="Name of run")
 parser.add_argument("--r-seed", type=int, default=42,
                     help="Random seed")
-parser.add_argument("--dropout-p-transformer", type=float, default=0.2,
+parser.add_argument("--dropout-p-rnn", type=float, default=0.2,
                     help="Dropout probability (drop rate, not keep rate)")
 parser.add_argument("--dropout-p-dense", type=float, default=0.5,
                     help="Dropout probability (drop rate, not keep rate)")
@@ -72,21 +59,12 @@ parser.add_argument("--no-cuda", action='store_true',
                     help="Disable GPU training")
 args = parser.parse_args()
 
-if len(args.test_datasets) == 0:
-    warnings.warn('No test datasets specified.')
-
-
-########################
-# MAKE RUN DESCRIPTORS #
-########################
-
 if args.run_name is None:
     args.run_name = f"{args.dataset.split('/')[-1].split('.')[0]}" \
-        f"_n-t-{args.num_layers}-d-{args.num_layers_dense}" \
-        f"_h-t-{args.d_model}-{args.d_ff}-{args.num_heads}-d-{args.hidden_size_dense}" \
-        f"_drop-t-{args.dropout_p_transformer}-d-{args.dropout_p_dense}" \
+        f"_n-r-{args.num_layers}-d-{args.num_layers_dense}" \
+        f"_h-r-{args.hidden_size}-d-{args.hidden_size_dense}" \
+        f"_drop-r-{args.dropout_p_rnn}-d-{args.dropout_p_dense}" \
         f"_reg-{'bayes' if args.bayes_reg else'l2'}" \
-        f"_test-{','.join(args.test_datasets)}" \
         f"_rseed-{args.r_seed}_start-{time.strftime('%y%b%d_%H%M', time.localtime())}"
 
 restore_args = " \\\n  ".join(sys.argv[1:])
@@ -111,14 +89,9 @@ srun stdbuf -oL -eL {sys.executable} \\
   --restore {{restore}}
 """
 
-
-####################
-# SET RANDOM SEEDS #
-####################
-
 if args.restore is not None:
     # prevent from repeating batches/seed when restoring at intermediate point
-    # script is repeatable as long as restored at same point with same restore string and same num_workers
+    # script is repeatable as long as restored at same point with same restore string
     args.r_seed += int(hashlib.sha1(args.restore.encode()).hexdigest(), 16)
     args.r_seed = args.r_seed % (2 ** 32 - 1)  # limit of np.random.seed
 
@@ -130,10 +103,6 @@ torch.cuda.manual_seed_all(args.r_seed)
 def _init_fn(worker_id):
     np.random.seed(args.r_seed + worker_id)
 
-
-#####################
-# PRINT SYSTEM INFO #
-#####################
 
 print("OS: ", sys.platform)
 print("Python: ", sys.version)
@@ -154,30 +123,17 @@ print()
 
 print("Run:", args.run_name)
 
-
-#############
-# LOAD DATA #
-#############
-
 print("Loading data.")
-dataset = data_loaders.IPIMultiDataset(
+dataset = data_loaders.IPITwoClassSingleClusteredSequenceDataset(
     batch_size=args.batch_size,
     working_dir=data_dir,
     dataset=args.dataset,
-    test_datasets=args.test_datasets,
+    classes=args.classes,
     train_val_split=args.train_val_split,
     matching=True,
     unlimited_epoch=True,
     include_vl=args.include_vl,
     include_vh=args.include_vh,
-    comparisons=(
-        (
-            args.comparison.split('-')[0],
-            args.comparison.split('-')[1],
-            args.comparison_thresh,
-            args.comparison_thresh
-        ),
-    ),
     output_shape='NLC',
     output_types='encoder',
 )
@@ -188,33 +144,26 @@ loader = data_loaders.GeneratorDataLoader(
     worker_init_fn=_init_fn
 )
 
-
-##############
-# LOAD MODEL #
-##############
-
 if args.restore is not None:
     print("Restoring model from:", args.restore)
     checkpoint = torch.load(args.restore, map_location='cpu' if device.type == 'cpu' else None)
     dims = checkpoint['model_dims']
     hyperparams = checkpoint['model_hyperparams']
     trainer_params = checkpoint['train_params']
-    if args.dropout_p_transformer is not None:
-        hyperparams['transformer']['dropout_p'] = args.dropout_p_transformer
+    if args.dropout_p_rnn is not None:
+        hyperparams['rnn']['dropout_p'] = args.dropout_p_rnn
     if args.dropout_p_dense is not None:
         hyperparams['dense']['dropout_p'] = args.dropout_p_dense
-    model = models.DiscriminativeTransformer(dims=dims, hyperparams=hyperparams)
+    model = models.DiscriminativeRNN(dims=dims, hyperparams=hyperparams)
 else:
     checkpoint = args.restore
     trainer_params = None
     dims = {'input': dataset.input_dim}
-    hyperparams = {'transformer': {}, 'dense': {}, 'regularization': {}}
+    hyperparams = {'rnn': {}, 'dense': {}, 'regularization': {}}
     for param_name_1, param_name_2, param in (
-        ('transformer', 'd_model', args.d_model),
-        ('transformer', 'd_ff', args.d_ff),
-        ('transformer', 'num_heads', args.num_heads),
-        ('transformer', 'num_layers', args.num_layers),
-        ('transformer', 'dropout_p', args.dropout_p_transformer),
+        ('rnn', 'hidden_size', args.hidden_size),
+        ('rnn', 'num_layers', args.num_layers),
+        ('rnn', 'dropout_p', args.dropout_p_rnn),
         ('dense', 'hidden_size', args.hidden_size_dense),
         ('dense', 'num_layers', args.num_layers_dense),
         ('dense', 'dropout_p', args.dropout_p_dense),
@@ -222,13 +171,8 @@ else:
     ):
         if param is not None:
             hyperparams[param_name_1][param_name_2] = param
-    model = models.DiscriminativeTransformer(dims=dims, hyperparams=hyperparams)
+    model = models.DiscriminativeRNN(dims=dims, hyperparams=hyperparams)
 model.to(device)
-
-
-################
-# RUN TRAINING #
-################
 
 trainer = trainers.ClassifierTrainer(
     model=model,
@@ -236,15 +180,15 @@ trainer = trainers.ClassifierTrainer(
     params=trainer_params,
     snapshot_path=working_dir + '/snapshots',
     snapshot_name=args.run_name,
-    snapshot_interval=args.num_iterations // 1,
+    snapshot_interval=args.num_iterations // 10,
     snapshot_exec_template=sbatch_executable,
     device=device,
     # logger=model_logging.Logger(),
     logger=model_logging.TensorboardLogger(
-        log_interval=100,
-        validation_interval=500,
-        generate_interval=500,
-        test_interval=500,
+        log_interval=500,
+        validation_interval=5000,
+        generate_interval=5000,
+        test_interval=5000,
         log_dir=working_dir + '/logs/' + args.run_name,
         print_output=True
     )
@@ -263,4 +207,5 @@ print("Dataset parameters:", json.dumps(dataset.params, indent=4))
 print("Num trainable parameters:", model.parameter_count())
 print(f"Training for {args.num_iterations - model.step} iterations.")
 
+trainer.save_state()
 trainer.train(steps=args.num_iterations)

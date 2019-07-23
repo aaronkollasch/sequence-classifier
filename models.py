@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from functions import Nonlinearity, l2_normalize
 from utils import recursive_update
-from functions import make_1d_mask, make_2d_mask
+from functions import make_1d_mask
 import layers
 import transformer_layers as t_layers
 

@@ -42,12 +42,8 @@ parser.add_argument("--batch-size", type=int, default=32,
                     help="Batch size.")
 parser.add_argument("--dataset", type=str, default=None,
                     help="Dataset name for fitting model.")
-parser.add_argument("--test-datasets", type=str, default=[], nargs='*',
-                    help="Datasets names in \"dataset\" column to use for testing.")
-parser.add_argument("--comparison", type=str, default="Aff1-PSR1",
-                    help="Comparison to test against.")
-parser.add_argument("--comparison-thresh", type=float, default=2.,
-                    help="Minimum counts to include in comparison.")
+parser.add_argument("--classes", type=str, nargs=2, default=["HighPSRAll", "LowPSRAll"],
+                    help="Classes to compare (negative, positive).")
 parser.add_argument("--train-val-split", type=float, default=0.9,
                     help="Proportion of training data to use for training.")
 parser.add_argument("--include-vl", action='store_true',
@@ -72,9 +68,6 @@ parser.add_argument("--no-cuda", action='store_true',
                     help="Disable GPU training")
 args = parser.parse_args()
 
-if len(args.test_datasets) == 0:
-    warnings.warn('No test datasets specified.')
-
 
 ########################
 # MAKE RUN DESCRIPTORS #
@@ -86,7 +79,6 @@ if args.run_name is None:
         f"_h-t-{args.d_model}-{args.d_ff}-{args.num_heads}-d-{args.hidden_size_dense}" \
         f"_drop-t-{args.dropout_p_transformer}-d-{args.dropout_p_dense}" \
         f"_reg-{'bayes' if args.bayes_reg else'l2'}" \
-        f"_test-{','.join(args.test_datasets)}" \
         f"_rseed-{args.r_seed}_start-{time.strftime('%y%b%d_%H%M', time.localtime())}"
 
 restore_args = " \\\n  ".join(sys.argv[1:])
@@ -160,24 +152,16 @@ print("Run:", args.run_name)
 #############
 
 print("Loading data.")
-dataset = data_loaders.IPIMultiDataset(
+dataset = data_loaders.IPITwoClassSingleClusteredSequenceDataset(
     batch_size=args.batch_size,
     working_dir=data_dir,
     dataset=args.dataset,
-    test_datasets=args.test_datasets,
+    classes=args.classes,
     train_val_split=args.train_val_split,
     matching=True,
     unlimited_epoch=True,
     include_vl=args.include_vl,
     include_vh=args.include_vh,
-    comparisons=(
-        (
-            args.comparison.split('-')[0],
-            args.comparison.split('-')[1],
-            args.comparison_thresh,
-            args.comparison_thresh
-        ),
-    ),
     output_shape='NLC',
     output_types='encoder',
 )
@@ -241,10 +225,10 @@ trainer = trainers.ClassifierTrainer(
     device=device,
     # logger=model_logging.Logger(),
     logger=model_logging.TensorboardLogger(
-        log_interval=100,
-        validation_interval=500,
-        generate_interval=500,
-        test_interval=500,
+        log_interval=500,
+        validation_interval=5000,
+        generate_interval=5000,
+        test_interval=5000,
         log_dir=working_dir + '/logs/' + args.run_name,
         print_output=True
     )
@@ -263,4 +247,5 @@ print("Dataset parameters:", json.dumps(dataset.params, indent=4))
 print("Num trainable parameters:", model.parameter_count())
 print(f"Training for {args.num_iterations - model.step} iterations.")
 
+trainer.save_state()
 trainer.train(steps=args.num_iterations)

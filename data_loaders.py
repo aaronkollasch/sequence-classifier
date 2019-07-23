@@ -2,6 +2,7 @@ import os
 import glob
 import math
 import itertools
+import re
 
 import numpy as np
 import pandas as pd
@@ -241,6 +242,7 @@ class SequenceDataset(GeneratorDataset):
         self.matching = matching
         self.output_shape = output_shape
         self.output_types = output_types
+        self.max_seq_len = -1
 
         if output_shape not in self.SUPPORTED_OUTPUT_SHAPES:
             raise KeyError(f'Unsupported output shape: {output_shape}')
@@ -376,6 +378,7 @@ class SequenceDataset(GeneratorDataset):
 
 class FastaDataset(SequenceDataset):
     """Load batches of sequences from a fasta file, either sequentially or sampled isotropically"""
+
     def __init__(
             self,
             dataset='',
@@ -388,6 +391,7 @@ class FastaDataset(SequenceDataset):
             output_shape='NCHW',
             output_types='decoder',
             kmer_params=None,
+            # TODO add shuffle parameter: iterate through shuffled sequences
     ):
         super(FastaDataset, self).__init__(
             batch_size=batch_size,
@@ -411,6 +415,7 @@ class FastaDataset(SequenceDataset):
         filename = os.path.join(self.working_dir, self.dataset)
         names_list = []
         sequence_list = []
+        max_seq_len = 0
 
         with open(filename, 'r') as fa:
             for i, (title, seq) in enumerate(SimpleFastaParser(fa)):
@@ -423,11 +428,15 @@ class FastaDataset(SequenceDataset):
 
                 names_list.append(title)
                 sequence_list.append(seq)
+                if len(seq) > max_seq_len:
+                    max_seq_len = len(seq)
 
         self.names = np.array(names_list)
         self.sequences = np.array(sequence_list)
+        self.max_seq_len = max_seq_len
 
         print("Number of sequences:", self.n_eff)
+        print("Max sequence length:", max_seq_len)
 
     @property
     def n_eff(self):
@@ -489,7 +498,6 @@ class SingleFamilyDataset(SequenceDataset):
         self.family_name_to_idx = {}
         self.idx_to_family_name = {}
 
-        self.seq_len = 0
         self.num_families = 0
         self.max_family_size = 0
 
@@ -545,13 +553,14 @@ class SingleFamilyDataset(SequenceDataset):
             self.family_idx_list.append(ind_family_idx_list)
 
         self.family_name = family_name
-        self.seq_len = max_seq_len
+        self.max_seq_len = max_seq_len
         self.num_families = len(self.family_name_list)
         self.max_family_size = max_family_size
 
         print("Number of families:", self.num_families)
         print("Neff:", np.sum(weight_list))
         print("Max family size:", max_family_size)
+        print("Max sequence length:", max_seq_len)
 
         for i, family_name in enumerate(self.family_name_list):
             self.family_name_to_idx[family_name] = i
@@ -612,6 +621,7 @@ class DoubleWeightedNanobodyDataset(SequenceDataset):
         self.load_data()
 
     def load_data(self):
+        max_seq_len = 0
         filename = self.working_dir + '/datasets/' + self.dataset
         with open(filename, 'r') as fa:
             for i, (title, seq) in enumerate(SimpleFastaParser(fa)):
@@ -634,9 +644,12 @@ class DoubleWeightedNanobodyDataset(SequenceDataset):
                 else:
                     self.clu1_to_clu2_to_seq_names[clu1] = {clu2: [name]}
                     self.clu1_to_clu2_to_clu_size[clu1] = {clu2: 1}
+                if len(seq) > max_seq_len:
+                    max_seq_len = len(seq)
 
         self.clu1_list = list(self.clu1_to_clu2_to_seq_names.keys())
         print("Num clusters:", len(self.clu1_list))
+        print("Max sequence length:", max_seq_len)
 
     @property
     def n_eff(self):
@@ -673,7 +686,6 @@ class AntibodySequenceDataset(SequenceDataset):
 
     def __init__(
             self,
-            dataset='',
             working_dir='.',
             batch_size=32,
             unlimited_epoch=True,
@@ -697,7 +709,6 @@ class AntibodySequenceDataset(SequenceDataset):
             output_types=output_types,
             kmer_params=kmer_params,
         )
-        self.dataset = dataset
         self.working_dir = working_dir
         self.include_vl = include_vl
         self.include_vh = include_vh
@@ -759,9 +770,11 @@ class AntibodySequenceDataset(SequenceDataset):
             self.vh_list = d['vh_seqs']
 
     def sequences_to_onehot(self, sequences, vls=None, vhs=None, reverse=None, matching=None):
+        reverse = self.reverse if reverse is None else reverse
         num_seqs = len(sequences)
         for i in range(num_seqs):
             # normalize CDR3 sequences to exclude constant characters
+            # TODO add strip_cw param
             if sequences[i][0] == 'C':
                 sequences[i] = sequences[i][1:]
             if sequences[i][-1] == 'W':
@@ -815,7 +828,442 @@ class AntibodySequenceDataset(SequenceDataset):
         raise NotImplementedError
 
 
+class IPIFastaDataset(AntibodySequenceDataset):
+    """Unweighted antibody dataset.
+    fasta: >*_heavy-{VH}_light-{VL}*
+    """
+
+    def __init__(
+            self,
+            dataset='',
+            working_dir='.',
+            batch_size=32,
+            unlimited_epoch=True,
+            alphabet_type='protein',
+            reverse=False,
+            matching=False,
+            output_shape='NLC',
+            output_types='encoder',
+            kmer_params=None,
+            include_vl=False,
+            include_vh=False,
+    ):
+        AntibodySequenceDataset.__init__(
+            self,
+            batch_size=batch_size,
+            unlimited_epoch=unlimited_epoch,
+            alphabet_type=alphabet_type,
+            reverse=reverse,
+            matching=matching,
+            output_shape=output_shape,
+            output_types=output_types,
+            kmer_params=kmer_params,
+            include_vl=include_vl,
+            include_vh=include_vh,
+        )
+        self.dataset = dataset
+        self.working_dir = working_dir
+
+        self.names = None
+        self.sequences = None
+        self.vhs = None
+        self.vls = None
+
+        self.load_data()
+
+    def load_data(self):
+        filename = os.path.join(self.working_dir, self.dataset)
+        names_list = []
+        sequence_list = []
+        vhs = []
+        vls = []
+        max_seq_len = 0
+        skipped_seqs = 0
+        name_pat = re.compile(r'_heavy-([A-Z0-9\-]+)_light-([A-Z0-9\-]+)')
+
+        with open(filename, 'r') as fa:
+            for i, (title, seq) in enumerate(SimpleFastaParser(fa)):
+                valid = True
+                for letter in seq:
+                    if letter not in self.aa_dict:
+                        valid = False
+                if not valid:
+                    skipped_seqs += 1
+                    continue
+
+                match = name_pat.search(title)
+                if not match or match.group(1) not in self.vh_list or match.group(2) not in self.vl_list:
+                    skipped_seqs += 1
+                    continue
+
+                names_list.append(title)
+                sequence_list.append(seq)
+                if len(seq) > max_seq_len:
+                    max_seq_len = len(seq)
+                vhs.append(match.group(1))
+                vls.append(match.group(2))
+
+        self.names = np.array(names_list)
+        self.sequences = np.array(sequence_list)
+        self.max_seq_len = max_seq_len
+        self.vhs = np.array(vhs)
+        self.vls = np.array(vls)
+
+        print("Number of sequences:", self.n_eff)
+        print("Number of sequences skipped:", skipped_seqs)
+        print("Max sequence length:", max_seq_len)
+
+    @property
+    def n_eff(self):
+        return len(self.sequences)  # not a true n_eff
+
+    def __getitem__(self, index):
+        """
+        :param index: batch index; ignored if unlimited_epoch
+        :return: batch of size self.batch_size
+        """
+
+        if self.unlimited_epoch:
+            indices = np.random.randint(0, self.n_eff, self.batch_size)
+        else:
+            first_index = index * self.batch_size
+            last_index = min((index + 1) * self.batch_size, self.n_eff)
+            indices = np.arange(first_index, last_index)
+
+        seqs = self.sequences[indices]
+        names = self.names[indices]
+        vhs = self.vhs[indices]
+        vls = self.vls[indices]
+        batch = self.sequences_to_onehot(seqs, vhs=vhs, vls=vls)
+        batch['names'] = names
+        batch['sequences'] = seqs
+        return batch
+
+
+class IPISingleClusteredSequenceDataset(AntibodySequenceDataset):
+    """Single-weighted antibody dataset.
+    fasta: >seq:vh:vl:clu1
+    clu1: cluster id
+    """
+
+    def __init__(
+            self,
+            dataset='',
+            working_dir='.',
+            batch_size=32,
+            unlimited_epoch=True,
+            alphabet_type='protein',
+            reverse=False,
+            matching=False,
+            output_shape='NLC',
+            output_types='encoder',
+            kmer_params=None,
+            include_vl=False,
+            include_vh=False,
+    ):
+        AntibodySequenceDataset.__init__(
+            self,
+            batch_size=batch_size,
+            unlimited_epoch=unlimited_epoch,
+            alphabet_type=alphabet_type,
+            reverse=reverse,
+            matching=matching,
+            output_shape=output_shape,
+            output_types=output_types,
+            kmer_params=kmer_params,
+            include_vl=include_vl,
+            include_vh=include_vh,
+        )
+        self.dataset = dataset
+        self.working_dir = working_dir
+
+        self.name_to_sequence = {}
+        self.clu1_to_seq_names = {}
+        self.clu1_list = []
+
+        self.load_data()
+
+    def load_data(self):
+        max_seq_len = 0
+        num_seqs = 0
+        filename = os.path.join(self.working_dir, self.dataset)
+        with open(filename, 'r') as fa:
+            for i, (title, seq) in enumerate(SimpleFastaParser(fa)):
+                name, vh, vl, clu1 = title.split(':')
+                valid = True
+                for letter in seq:
+                    if letter not in self.aa_dict:
+                        valid = False
+                if not valid:
+                    continue
+                elif vh not in self.vh_list:
+                    print(f"Unrecognized VH gene: {vh}")
+                    continue
+                elif vl not in self.vl_list:
+                    print(f"Unrecognized VL gene: {vl}")
+                    continue
+
+                name = f"{name}:{vh}:{vl}"
+                if name in self.name_to_sequence:
+                    print(f"Name collision: {name}")
+                self.name_to_sequence[name] = seq
+                if clu1 in self.clu1_to_seq_names:
+                    self.clu1_to_seq_names[clu1].append(name)
+                else:
+                    self.clu1_to_seq_names[clu1] = [name]
+
+                if len(seq) > max_seq_len:
+                    max_seq_len = len(seq)
+                num_seqs += 1
+
+        self.clu1_list = list(self.clu1_to_seq_names.keys())
+        self.max_seq_len = max_seq_len
+
+        print("Num clusters:", len(self.clu1_list))
+        print("Num sequences:", num_seqs)
+        print("Max sequence length:", max_seq_len)
+
+    @property
+    def n_eff(self):
+        return len(self.clu1_list)
+
+    def __getitem__(self, index):
+        """
+        :param index: ignored
+        :return: batch of size self.batch_size
+        """
+        names = []
+        vhs = []
+        vls = []
+        seqs = []
+        for i in range(self.batch_size):
+            # Pick a cluster id90
+            clu1_idx = np.random.randint(0, len(self.clu1_list))
+            clu1 = self.clu1_list[clu1_idx]
+
+            # Then pick a random sequence all in those clusters
+            seq_name = np.random.choice(self.clu1_to_seq_names[clu1])
+            _, vh, vl = seq_name.split(':')
+            names.append(seq_name)
+            vhs.append(vh)
+            vls.append(vl)
+
+            # then grab the associated sequence
+            seqs.append(self.name_to_sequence[seq_name])
+
+        batch = self.sequences_to_onehot(seqs, vhs=vhs, vls=vls)
+        batch['names'] = names
+        batch['sequences'] = seqs
+        return batch
+
+
+class IPITwoClassSingleClusteredSequenceDataset(AntibodySequenceDataset, TrainValTestDataset):
+    """Single-weighted antibody dataset.
+    fasta: >seq:vh:vl:clu1:class
+    clu1: cluster id
+    """
+
+    def __init__(
+            self,
+            dataset='',
+            working_dir='.',
+            batch_size=32,
+            unlimited_epoch=True,
+            alphabet_type='protein',
+            reverse=False,
+            matching=False,
+            output_shape='NLC',
+            output_types='encoder',
+            kmer_params=None,
+            classes=('HighPSRAll', 'LowPSRAll'),
+            train_val_split=1.0,
+            split_seed=42,
+            include_vl=False,
+            include_vh=False,
+    ):
+        AntibodySequenceDataset.__init__(
+            self,
+            batch_size=batch_size,
+            unlimited_epoch=unlimited_epoch,
+            alphabet_type=alphabet_type,
+            reverse=reverse,
+            matching=matching,
+            output_shape=output_shape,
+            output_types=output_types,
+            kmer_params=kmer_params,
+            include_vl=include_vl,
+            include_vh=include_vh,
+        )
+        TrainValTestDataset.__init__(self)
+        self.dataset = dataset
+        self.working_dir = working_dir
+        self.train_val_split = train_val_split
+        self.split_seed = split_seed
+
+        self.classes = classes
+        self.name_to_sequence = {}
+        self._clu1_to_seq_names = {}
+        self.clu1_val_to_seq_names = {}
+        self.all_clu1 = []
+        self.clu1_train = []
+        self.clu1_val = []
+        self.cdr_to_output = {}
+        self.comparison_pos_weights = torch.ones(1)
+
+        self.load_data()
+
+    def load_data(self):
+        max_seq_len = 0
+        num_seqs = 0
+        filename = os.path.join(self.working_dir, self.dataset)
+        with open(filename, 'r') as fa:
+            for i, (title, seq) in enumerate(SimpleFastaParser(fa)):
+                name, vh, vl, clu1, seq_class = title.split(':')
+                if seq_class not in self.classes:
+                    print(f"Unrecognized class: {seq_class}")
+                    continue
+                elif vh not in self.vh_list:
+                    print(f"Unrecognized VH gene: {vh}")
+                    continue
+                elif vl not in self.vl_list:
+                    print(f"Unrecognized VL gene: {vl}")
+                    continue
+
+                valid = True
+                for letter in seq:
+                    if letter not in self.aa_dict:
+                        valid = False
+                if not valid:
+                    continue
+
+                name = f"{name}:{vh}:{vl}:{seq_class}"
+                if name in self.name_to_sequence:
+                    print(f"Name collision: {name}")
+                self.name_to_sequence[name] = seq
+                if clu1 in self._clu1_to_seq_names:
+                    self._clu1_to_seq_names[clu1].append(name)
+                else:
+                    self._clu1_to_seq_names[clu1] = [name]
+
+                if len(seq) > max_seq_len:
+                    max_seq_len = len(seq)
+                num_seqs += 1
+
+        self.all_clu1 = np.array(list(self._clu1_to_seq_names.keys()))
+        for clu1 in self.all_clu1:
+            if len(clu1.split(':')) > 1:
+                print(clu1)
+        self.max_seq_len = max_seq_len
+
+        # calculate fraction in positive class for weighting
+        weighted_total_positive = 0
+        for names in self._clu1_to_seq_names.values():
+            for name in names:
+                seq_class = name.split(':')[-1]
+                weighted_total_positive += float(seq_class == self.classes[1]) / len(names)
+        pos_frac = weighted_total_positive / len(self.all_clu1)
+        pos_weight = (len(self.all_clu1) - weighted_total_positive) / weighted_total_positive
+        self.comparison_pos_weights[0] = pos_weight
+
+        print("Num clusters:", len(self.all_clu1))
+        print(f"{pos_frac*100:0.1f}% positive, {pos_weight:0.4f} pos_weight")
+        print("Num sequences:", num_seqs)
+        print("Max sequence length:", max_seq_len)
+
+        # split data into train-val
+        with temp_seed(self.split_seed):
+            indices = np.random.permutation(len(self.all_clu1))
+            partition = math.ceil(len(indices) * self.train_val_split)
+            training_idx, val_idx = indices[:partition], indices[partition:]
+            self.clu1_train, self.clu1_val = self.all_clu1[training_idx], self.all_clu1[val_idx]
+
+            # pre-sample validation sequences
+            self.clu1_val_to_seq_names = {
+                clu1: [np.random.choice(self._clu1_to_seq_names[clu1])] for clu1 in self.clu1_val
+            }
+            print(f'train-val split: {self.train_val_split}')
+            print(f'num train, val clusters: {len(self.clu1_train)}, {len(self.clu1_val)}')
+
+    @property
+    def n_eff(self):
+        return len(self.clu1_names)
+
+    @property
+    def params(self):
+        params = super(IPITwoClassSingleClusteredSequenceDataset, self).params
+        params.update({
+            "classes": self.classes,
+            "train_val_split": self.train_val_split,
+            "split_seed": self.split_seed,
+        })
+        return params
+
+    @params.setter
+    def params(self, d):
+        AntibodySequenceDataset.params.__set__(self, d)
+        if 'classes' in d:
+            self.classes = d['classes']
+        if 'train_val_split' in d:
+            self.train_val_split = d['train_val_split']
+        if 'split_seed' in d:
+            self.split_seed = d['split_seed']
+
+    @property
+    def clu1_names(self):
+        if self._mode == 'train':
+            return self.clu1_train
+        elif self._mode == 'val':
+            return self.clu1_val
+        else:
+            raise ValueError("No test data available")
+
+    @property
+    def clu1_to_seq_names(self):
+        if self._mode == 'val':
+            return self.clu1_val_to_seq_names
+        else:
+            return self._clu1_to_seq_names
+
+    def __getitem__(self, index):
+        """
+        :param index: ignored if self.unlimited_epoch
+        :return: batch of size self.batch_size
+        """
+        # Pick clusters
+        if self.unlimited_epoch:
+            indices = np.random.randint(0, self.n_eff, self.batch_size)
+        else:
+            first_index = index * self.batch_size
+            last_index = min((index + 1) * self.batch_size, self.n_eff)
+            indices = np.arange(first_index, last_index)
+
+        clu1_names = self.clu1_names[indices].tolist()
+        names = []
+        vhs = []
+        vls = []
+        seqs = []
+        label_arr = torch.zeros(len(indices), 1)
+        for i, clu1 in enumerate(clu1_names):
+            # Pick a random sequence in that cluster
+            seq_name = np.random.choice(self.clu1_to_seq_names[clu1])
+            _, vh, vl, seq_class = seq_name.split(':')
+            names.append(seq_name)
+            vhs.append(vh)
+            vls.append(vl)
+            label_arr[i] = float(seq_class == self.classes[1])
+
+            # then grab the associated sequence
+            seqs.append(self.name_to_sequence[seq_name])
+
+        batch = self.sequences_to_onehot(seqs, vhs=vhs, vls=vls)
+        batch['names'] = names
+        batch['sequences'] = seqs
+        batch['label'] = label_arr
+        return batch
+
+
 class IPISingleDataset(AntibodySequenceDataset, TrainValTestDataset):
+    """Dataset for single IPI sort experiment"""
     LABELED = True
 
     def __init__(
@@ -855,8 +1303,6 @@ class IPISingleDataset(AntibodySequenceDataset, TrainValTestDataset):
         self.comparisons = comparisons
         self.train_val_split = train_val_split
         self.split_seed = split_seed
-        self.include_vl = include_vl
-        self.include_vh = include_vh
 
         self.cdr_to_output = {}
         self.cdr_to_heavy = {}
@@ -929,8 +1375,8 @@ class IPISingleDataset(AntibodySequenceDataset, TrainValTestDataset):
         params = super(IPISingleDataset, self).params
         params.update({
             "comparisons": self.comparisons,
-            "train_val_split": 1.0,
-            "split_seed": 42,
+            "train_val_split": self.train_val_split,
+            "split_seed": self.split_seed,
         })
         return params
 
@@ -977,6 +1423,7 @@ class IPISingleDataset(AntibodySequenceDataset, TrainValTestDataset):
 
 
 class IPIMultiDataset(AntibodySequenceDataset, TrainValTestDataset):
+    """Datset for multiple IPI sorts"""
     LABELED = True
 
     def __init__(
@@ -1102,8 +1549,8 @@ class IPIMultiDataset(AntibodySequenceDataset, TrainValTestDataset):
         params.update({
             "test_datasets": self.test_datasets,
             "comparisons": self.comparisons,
-            "train_val_split": 1.0,
-            "split_seed": 42,
+            "train_val_split": self.train_val_split,
+            "split_seed": self.split_seed,
         })
         return params
 

@@ -1,4 +1,4 @@
-# code referenced from http://nlp.seas.harvard.edu/2018/04/03/attention.html
+# code adapted from http://nlp.seas.harvard.edu/2018/04/03/attention.html
 import math
 
 import torch
@@ -189,7 +189,7 @@ class MultiHeadedAttention(nn.Module):
         x, self.attn = attention(query, key, value, mask=mask, dropout=self.p)
 
         # 3) "Concat" using a view and apply a final linear.
-        x = x.transpose(1, 2).contiguous().view(nbatches, -1, self.h * self.d_k)
+        x = x.transpose(1, 2).contiguous().view((nbatches, -1, self.h * self.d_k))
         return self.linears[-1](x)
 
 
