@@ -139,3 +139,33 @@ def get_cudnn_version():
             return "Cannot find CUDNN version"
     else:
         return "No CUDNN in this machine"
+
+
+class Tee(object):
+    """Duplicate output to file and sys.stdout
+    From https://stackoverflow.com/questions/616645/how-to-duplicate-sys-stdout-to-a-log-file"""
+
+    def __init__(self, name, mode):
+        self.file = open(name, mode)
+        self.stdout = sys.stdout
+        sys.stdout = self
+
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        sys.stdout = self.stdout
+        self.file.close()
+
+    def write(self, data):
+        self.file.write(data)
+        self.stdout.write(data)
+
+    def flush(self):
+        self.file.flush()
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, _type, _value, _traceback):
+        self.close()

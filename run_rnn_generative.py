@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import sys
+import os
 import argparse
 import time
 import json
@@ -13,7 +14,7 @@ import data_loaders
 import models
 import trainers
 import model_logging
-from utils import get_cuda_version, get_cudnn_version
+from utils import get_cuda_version, get_cudnn_version, Tee
 
 # working_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
 # data_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
@@ -111,6 +112,9 @@ torch.cuda.manual_seed_all(args.r_seed)
 def _init_fn(worker_id):
     np.random.seed(args.r_seed + worker_id)
 
+
+os.makedirs(f'logs/{args.run_name}', exist_ok=True)
+log_f = Tee(f'logs/{args.run_name}/log.txt', 'a')
 
 print("OS: ", sys.platform)
 print("Python: ", sys.version)
