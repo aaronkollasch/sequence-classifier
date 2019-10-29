@@ -199,9 +199,14 @@ class ClassifierTrainer:
         exit_local_rng_state(prev_state)
         return losses, accuracies, true_outputs, logits, roc_scores
 
-    def test(self, model_eval=True, num_samples=1, r_seed=42):
+    def test(self, model_eval=True, dataset_state='test', num_samples=1, r_seed=42, raw_output=False):
         if isinstance(self.loader.dataset, TrainValTestDataset):
-            self.loader.dataset.test()
+            if dataset_state == 'train':
+                self.loader.dataset.train()
+            elif dataset_state == 'val':
+                self.loader.dataset.val()
+            else:
+                self.loader.dataset.test()
 
         try:
             n_eff = self.loader.dataset.n_eff
@@ -214,14 +219,21 @@ class ClassifierTrainer:
         if model_eval:
             self.model.eval()
         prev_state = enter_local_rng_state(r_seed)
+        prev_unlimited_epoch = self.loader.dataset.unlimited_epoch
         self.loader.dataset.unlimited_epoch = False
         loader = GeneratorDataLoader(self.loader.dataset, num_workers=self.loader.num_workers)
-        pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
 
         true_outputs = []
-        sequences = []
         logits = []
+        output = {
+            'name': [],
+            'sequence': []
+        }
         for i_iter in range(num_samples):
+            output_i = {
+                'name': [],
+                'sequence': []
+            }
             true_outputs = []
             logits_i = []
             sequences = []
@@ -234,40 +246,49 @@ class ClassifierTrainer:
                 with torch.no_grad():
                     output_logits = self.model(batch['input'], batch['mask'])
 
-                true_outputs.append(batch['label'])
+                if not raw_output:
+                    true_outputs.append(batch['label'])
                 sequences.extend(batch['sequences'])
+                output_i['name'].extend(batch['names'])
+                output_i['sequence'].extend(batch['sequences'])
                 logits_i.append(output_logits)
 
-            true_outputs = torch.cat(true_outputs, 0)
+            output['name'] = output_i['name']
+            output['sequence'] = output_i['sequence']
+            if not raw_output:
+                true_outputs = torch.cat(true_outputs, 0)
             logits.append(torch.cat(logits_i, 0))
 
-        logits = torch.stack(logits, 0).mean(0)
+        logits = torch.stack(logits, 0).mean(0).cpu().numpy()
 
-        loss_dict = self.model.calculate_loss(
-            logits, true_outputs, n_eff=n_eff, pos_weight=pos_weights, reduction='none')
-        error = self.model.calculate_accuracy(
-            logits, true_outputs, reduction='none')
+        if not raw_output:
+            pos_weights = self.loader.dataset.comparison_pos_weights.to(self.device)
+            loss_dict = self.model.calculate_loss(
+                logits, true_outputs, n_eff=n_eff, pos_weight=pos_weights, reduction='none')
+            error = self.model.calculate_accuracy(
+                logits, true_outputs, reduction='none')
+            true_outputs = true_outputs.cpu().numpy()
 
-        true_outputs = true_outputs.cpu().numpy()
-        logits = logits.cpu().numpy()
-        roc_scores = roc_auc_score(true_outputs, logits, average=None)
-        if isinstance(roc_scores, np.ndarray):
-            roc_scores = roc_scores.tolist()
-        else:
-            roc_scores = [roc_scores]
-
-        # TODO return output per test sequence as well
-        true_outputs = true_outputs.mean(0).tolist()
-        logits = logits.mean(0).tolist()
-        losses = loss_dict['ce_loss'].mean(0).cpu().tolist()
-        accuracies = error.mean(0).cpu().tolist()
+            roc_scores = roc_auc_score(true_outputs, logits, average=None)
+            if isinstance(roc_scores, np.ndarray):
+                roc_scores = roc_scores.tolist()
+            else:
+                roc_scores = [roc_scores]
 
         self.model.train()
         if isinstance(self.loader.dataset, TrainValTestDataset):
             self.loader.dataset.train()
-        self.loader.dataset.unlimited_epoch = True
+        self.loader.dataset.unlimited_epoch = prev_unlimited_epoch
         exit_local_rng_state(prev_state)
-        return losses, accuracies, true_outputs, logits, roc_scores
+
+        if raw_output:
+            return output, logits
+        else:
+            true_outputs = true_outputs.mean(0).tolist()
+            logits = logits.mean(0).tolist()
+            losses = loss_dict['ce_loss'].mean(0).cpu().tolist()
+            accuracies = error.mean(0).cpu().tolist()
+            return losses, accuracies, true_outputs, logits, roc_scores
 
     def save_state(self, last_batch=None):
         snapshot = f"{self.params['snapshot_path']}/{self.params['snapshot_name']}/{self.model.step}.pth"
@@ -300,7 +321,7 @@ class ClassifierTrainer:
     def load_state(self, checkpoint, map_location=None):
         if not isinstance(checkpoint, dict):
             checkpoint = torch.load(checkpoint, map_location=map_location)
-        if self.model.model_type != checkpoint['model_type']:
+        if self.model.MODEL_TYPE != checkpoint['model_type']:
             print("Warning: model type mismatch: loaded type {} for model type {}".format(
                 checkpoint['model_type'], self.model.model_type
             ))
