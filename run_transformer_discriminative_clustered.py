@@ -14,7 +14,7 @@ import data_loaders
 import models
 import trainers
 import model_logging
-from utils import get_cuda_version, get_cudnn_version, Tee
+from utils import get_cuda_version, get_cudnn_version, get_github_head_hash, Tee
 
 working_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
 data_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
@@ -72,8 +72,11 @@ args = parser.parse_args()
 # MAKE RUN DESCRIPTORS #
 ########################
 
+dataset_name = args.dataset.split('/')[-1].split('.')[0]
+
 if args.run_name is None:
-    args.run_name = f"{args.dataset.split('/')[-1].split('.')[0]}" \
+    args.run_name = f"{dataset_name}" \
+        f"_in-{'-'.join(args.include_inputs)}" \
         f"_n-t-{args.num_layers}-d-{args.num_layers_dense}" \
         f"_h-t-{args.d_model}-{args.d_ff}-{args.num_heads}-d-{args.hidden_size_dense}" \
         f"_drop-t-{args.dropout_p_transformer}-d-{args.dropout_p_dense}" \
@@ -102,6 +105,9 @@ srun stdbuf -oL -eL {sys.executable} \\
   --restore {{restore}}
 """
 
+log_dir = working_dir + f'/logs/{dataset_name}/{args.run_name}'
+snapshot_dir = working_dir + f'/snapshots/{dataset_name}'
+
 
 ####################
 # SET RANDOM SEEDS #
@@ -126,9 +132,10 @@ def _init_fn(worker_id):
 # PRINT SYSTEM INFO #
 #####################
 
-os.makedirs(f'logs/{args.run_name}', exist_ok=True)
-log_f = Tee(f'logs/{args.run_name}/log.txt', 'a')
+os.makedirs(log_dir, exist_ok=True)
+log_f = Tee(log_dir + f'/log.txt', 'a')
 
+print('Call:', ' '.join(sys.argv))
 print("OS: ", sys.platform)
 print("Python: ", sys.version)
 print("PyTorch: ", torch.__version__)
@@ -144,6 +151,8 @@ if device.type == 'cuda':
     print('Cached:   ', round(torch.cuda.memory_cached(0)/1024**3, 1), 'GB')
     print(get_cuda_version())
     print("CuDNN Version ", get_cudnn_version())
+
+print("git hash:", str(get_github_head_hash()))
 print()
 
 print("Run:", args.run_name)
@@ -219,9 +228,9 @@ trainer = trainers.ClassifierTrainer(
     model=model,
     data_loader=loader,
     params=trainer_params,
-    snapshot_path=working_dir + '/snapshots',
+    snapshot_path=snapshot_dir,
     snapshot_name=args.run_name,
-    snapshot_interval=args.num_iterations // 1,
+    snapshot_interval=args.num_iterations // 2,
     snapshot_exec_template=sbatch_executable,
     device=device,
     # logger=model_logging.Logger(),
@@ -230,7 +239,7 @@ trainer = trainers.ClassifierTrainer(
         validation_interval=5000,
         generate_interval=5000,
         test_interval=5000,
-        log_dir=working_dir + '/logs/' + args.run_name,
+        log_dir=log_dir,
         print_output=True
     )
 )

@@ -10,6 +10,7 @@ import copy
 import numpy as np
 import torch
 import torch.nn as nn
+import git
 
 
 def clones(module, n):
@@ -141,6 +142,18 @@ def get_cudnn_version():
         return "No CUDNN in this machine"
 
 
+def get_github_head_hash():
+    """
+    https://stackoverflow.com/questions/14989858/get-the-current-git-hash-in-a-python-script
+    :return:
+    """
+    try:
+        repo = git.Repo(search_parent_directories=True)
+        return repo.head.object.hexsha
+    except git.GitError:
+        return None
+
+
 class Tee(object):
     """Duplicate output to file and sys.stdout
     From https://stackoverflow.com/questions/616645/how-to-duplicate-sys-stdout-to-a-log-file"""
@@ -163,6 +176,7 @@ class Tee(object):
 
     def flush(self):
         self.file.flush()
+        self.stdout.flush()
 
     def __enter__(self):
         pass

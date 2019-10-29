@@ -5,7 +5,6 @@ import argparse
 import time
 import json
 import hashlib
-import warnings
 
 import numpy as np
 import torch
@@ -14,7 +13,7 @@ import data_loaders
 import models
 import trainers
 import model_logging
-from utils import get_cuda_version, get_cudnn_version, Tee
+from utils import get_cuda_version, get_cudnn_version, get_github_head_hash, Tee
 
 working_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
 data_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
@@ -39,10 +38,16 @@ parser.add_argument("--classes", type=str, nargs=2, default=["HighPSRAll", "LowP
                     help="Classes to compare (negative, positive).")
 parser.add_argument("--train-val-split", type=float, default=0.9,
                     help="Proportion of training data to use for training.")
+parser.add_argument("--input-type", type=str, default="kmer_vector",
+                    help="Data type to use in the input. (kmer_vector, aligned)")
 parser.add_argument("--include-inputs", nargs='*', default=('seq', 'vh', 'vl'),
                     help="Data to include in the input. (seq, vh, vl)")
 parser.add_argument("--max-k", type=int, default=3,
                     help="Maximum k-mer size.")
+parser.add_argument("--max-seq-len", type=int, default=20,
+                    help="Maximum aligned input length.")
+parser.add_argument('--mask-gaps', action='store_true',
+                    help="Do not include gap characters as features.")
 parser.add_argument("--include-length", action='store_true',
                     help="Include the CDR3 length as a feature in the k-mer vector.")
 parser.add_argument("--num-data-workers", type=int, default=4,
@@ -66,8 +71,15 @@ args = parser.parse_args()
 # MAKE RUN DESCRIPTORS #
 ########################
 
+dataset_name = args.dataset.split('/')[-1].split('.')[0]
+
+inputs = args.include_inputs
+if 'seq' in inputs and args.input_type == 'kmer_vector':
+    inputs[inputs.index('seq')] = str(args.max_k)+'mer'
+
 if args.run_name is None:
-    args.run_name = f"{args.dataset.split('/')[-1].split('.')[0]}" \
+    args.run_name = f"{dataset_name}" \
+        f"_in-{args.input_type}-{'-'.join(inputs)}{'-len' if args.include_length else ''}" \
         f"_dense_n-{args.num_layers}_h-{args.hidden_size}_drop-{args.dropout_p}" \
         f"_reg-{'bayes' if args.bayes_reg else'l2'}" \
         f"_rseed-{args.r_seed}_start-{time.strftime('%y%b%d_%H%M', time.localtime())}"
@@ -93,6 +105,8 @@ srun stdbuf -oL -eL {sys.executable} \\
   {restore_args} \\
   --restore {{restore}}
 """
+log_dir = working_dir + f'/logs/{dataset_name}/{args.run_name}'
+snapshot_dir = working_dir + f'/snapshots/{dataset_name}'
 
 
 ####################
@@ -118,9 +132,10 @@ def _init_fn(worker_id):
 # PRINT SYSTEM INFO #
 #####################
 
-os.makedirs(f'logs/{args.run_name}', exist_ok=True)
-log_f = Tee(f'logs/{args.run_name}/log.txt', 'a')
+os.makedirs(log_dir, exist_ok=True)
+log_f = Tee(log_dir + f'/log.txt', 'a')
 
+print('Call:', ' '.join(sys.argv))
 print("OS: ", sys.platform)
 print("Python: ", sys.version)
 print("PyTorch: ", torch.__version__)
@@ -136,28 +151,32 @@ if device.type == 'cuda':
     print('Cached:   ', round(torch.cuda.memory_cached(0)/1024**3, 1), 'GB')
     print(get_cuda_version())
     print("CuDNN Version ", get_cudnn_version())
+
+print("git hash:", str(get_github_head_hash()))
 print()
+
+print("Run:", args.run_name)
 
 
 #############
 # LOAD DATA #
 #############
 
-print("Run:", args.run_name)
-
 print("Loading data.")
 dataset = data_loaders.IPITwoClassSingleClusteredSequenceDataset(
     batch_size=args.batch_size,
     working_dir=data_dir,
     dataset=args.dataset,
+    classes=args.classes,
     train_val_split=args.train_val_split,
     matching=True,
     unlimited_epoch=True,
     include_inputs=args.include_inputs,
-    classes=args.classes,
     output_shape='NLC',
-    output_types='kmer_vector',
-    kmer_params=dict(max_k=args.max_k, include_length=args.include_length),
+    output_types=args.input_type,
+    alphabet_type='protein_gapped' if args.input_type == 'aligned' and not args.mask_gaps else 'protein',
+    kmer_params=dict(max_k=args.max_k, include_length=args.include_length) if args.input_type == 'kmer_vector' else None,
+    aligned_params=dict(max_seq_len=args.max_seq_len, mask_gaps=args.mask_gaps) if args.input_type == 'aligned' else None,
 )
 loader = data_loaders.GeneratorDataLoader(
     dataset,
@@ -183,7 +202,7 @@ if args.restore is not None:
 else:
     checkpoint = args.restore
     trainer_params = None
-    dims = {'length': 1, 'input': dataset.input_dim}
+    dims = {'length': args.max_seq_len if args.input_type == 'aligned' else 1, 'input': dataset.input_dim}
     hyperparams = {'dense': {}, 'regularization': {}}
     for param_name_1, param_name_2, param in (
         ('dense', 'hidden_size', args.hidden_size),
@@ -205,7 +224,7 @@ trainer = trainers.ClassifierTrainer(
     model=model,
     data_loader=loader,
     params=trainer_params,
-    snapshot_path=working_dir + '/snapshots',
+    snapshot_path=snapshot_dir,
     snapshot_name=args.run_name,
     snapshot_interval=args.num_iterations // 10,
     snapshot_exec_template=sbatch_executable,
@@ -216,7 +235,7 @@ trainer = trainers.ClassifierTrainer(
         validation_interval=5000,
         generate_interval=5000,
         test_interval=5000,
-        log_dir=working_dir + '/logs/' + args.run_name,
+        log_dir=log_dir,
         print_output=True
     )
 )

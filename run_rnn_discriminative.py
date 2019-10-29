@@ -14,7 +14,7 @@ import data_loaders
 import models
 import trainers
 import model_logging
-from utils import get_cuda_version, get_cudnn_version, Tee
+from utils import get_cuda_version, get_cudnn_version, get_github_head_hash, Tee
 
 working_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
 data_dir = '/n/groups/marks/projects/antibodies/sequence-classifier/code'
@@ -114,6 +114,7 @@ def _init_fn(worker_id):
 os.makedirs(f'logs/{args.run_name}', exist_ok=True)
 log_f = Tee(f'logs/{args.run_name}/log.txt', 'a')
 
+print('Call:', ' '.join(sys.argv))
 print("OS: ", sys.platform)
 print("Python: ", sys.version)
 print("PyTorch: ", torch.__version__)
@@ -129,6 +130,8 @@ if device.type == 'cuda':
     print('Cached:   ', round(torch.cuda.memory_cached(0)/1024**3, 1), 'GB')
     print(get_cuda_version())
     print("CuDNN Version ", get_cudnn_version())
+
+print("git hash:", str(get_github_head_hash()))
 print()
 
 print("Run:", args.run_name)
